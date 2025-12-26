@@ -471,7 +471,7 @@ class SeedrClientWrapper:
                     
                     # Get download URL
                     try:
-                        file_info = await self._client.fetch_file(str(file.id))
+                        file_info = await self._client.fetch_file(str(file.file_id))
                         download_url = file_info.url
                         
                         # Download the file with progress tracking
