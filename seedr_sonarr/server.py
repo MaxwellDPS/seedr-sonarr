@@ -52,6 +52,8 @@ settings = Settings()
 seedr_client: Optional[SeedrClientWrapper] = None
 sessions: dict[str, datetime] = {}
 SESSION_TIMEOUT = timedelta(hours=24)
+# Store created categories: name -> savePath
+created_categories: dict[str, str] = {}
 
 
 @asynccontextmanager
@@ -693,15 +695,23 @@ async def torrents_categories(request: Request):
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     
-    # Return dynamic categories based on what we've seen
-    categories = set(seedr_client._category_mapping.values())
     result = {}
-    for cat in categories:
-        if cat:
-            result[cat] = {
-                "name": cat,
-                "savePath": os.path.join(settings.download_path, cat),
-            }
+    
+    # Add explicitly created categories
+    for cat_name, save_path in created_categories.items():
+        result[cat_name] = {
+            "name": cat_name,
+            "savePath": save_path,
+        }
+    
+    # Also add categories from torrents
+    if seedr_client:
+        for cat in set(seedr_client._category_mapping.values()):
+            if cat and cat not in result:
+                result[cat] = {
+                    "name": cat,
+                    "savePath": os.path.join(settings.download_path, cat),
+                }
     
     return JSONResponse(result)
 
@@ -713,7 +723,12 @@ async def torrents_create_category(
     """Create a category."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    # Categories are implicitly created when used
+    
+    # Store the category
+    save_path = savePath if savePath else os.path.join(settings.download_path, category)
+    created_categories[category] = save_path
+    logger.info(f"Created category: {category} -> {save_path}")
+    
     return PlainTextResponse("Ok.")
 
 
@@ -724,6 +739,28 @@ async def torrents_remove_categories(
     """Remove categories."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+    
+    for cat in categories.split("\n"):
+        cat = cat.strip()
+        if cat and cat in created_categories:
+            del created_categories[cat]
+            logger.info(f"Removed category: {cat}")
+    
+    return PlainTextResponse("Ok.")
+
+
+@app.post("/api/v2/torrents/editCategory")
+async def torrents_edit_category(
+    request: Request, category: str = Form(...), savePath: str = Form("")
+):
+    """Edit a category."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    save_path = savePath if savePath else os.path.join(settings.download_path, category)
+    created_categories[category] = save_path
+    logger.info(f"Edited category: {category} -> {save_path}")
+    
     return PlainTextResponse("Ok.")
 
 
@@ -825,8 +862,17 @@ async def sync_maindata(request: Request, rid: int = 0):
 
         # Get categories
         categories = {}
+        
+        # Add explicitly created categories
+        for cat_name, save_path in created_categories.items():
+            categories[cat_name] = {
+                "name": cat_name,
+                "savePath": save_path,
+            }
+        
+        # Also add categories from torrents
         for cat in set(seedr_client._category_mapping.values()):
-            if cat:
+            if cat and cat not in categories:
                 categories[cat] = {
                     "name": cat,
                     "savePath": os.path.join(settings.download_path, cat),
