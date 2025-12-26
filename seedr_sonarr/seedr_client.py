@@ -1,6 +1,7 @@
 """
 Seedr Client Wrapper
 Provides a clean interface to the Seedr API using seedrcc library.
+Includes automatic downloading, storage management, and queue system.
 """
 
 import asyncio
@@ -10,9 +11,11 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Callable
+from collections import deque
 import os
 import aiohttp
 import aiofiles
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,24 @@ class TorrentState(Enum):
     # Custom states for local download tracking
     DOWNLOADING_LOCAL = "downloading"  # Downloading from Seedr to local
     COMPLETED_LOCAL = "pausedUP"  # Fully downloaded locally
+    # Queue states
+    QUEUED_STORAGE = "queuedDL"  # Waiting for Seedr storage space
+
+
+@dataclass
+class QueuedTorrent:
+    """Represents a torrent waiting to be added to Seedr."""
+    id: str  # Unique queue ID
+    magnet_link: Optional[str] = None
+    torrent_file: Optional[bytes] = None
+    category: str = ""
+    added_time: float = 0.0
+    name: str = "Queued Torrent"
+    estimated_size: int = 0  # Estimated size in bytes (if known)
+    
+    def __post_init__(self):
+        if not self.added_time:
+            self.added_time = datetime.now().timestamp()
 
 
 @dataclass
@@ -76,12 +97,14 @@ class SeedrTorrent:
     # Local download tracking
     local_progress: float = 0.0  # Progress of downloading to local storage
     is_local: bool = False  # True if fully downloaded locally
+    # Queue info
+    is_queued: bool = False  # True if waiting in queue
 
 
 class SeedrClientWrapper:
     """
     Wrapper around seedrcc that provides simplified interface for the proxy.
-    Handles authentication, token refresh, and API calls.
+    Handles authentication, token refresh, API calls, storage management, and queuing.
     """
 
     def __init__(
@@ -91,7 +114,8 @@ class SeedrClientWrapper:
         token: Optional[str] = None,
         download_path: str = "/downloads",
         auto_download: bool = True,
-        delete_after_download: bool = False,
+        delete_after_download: bool = True,
+        storage_buffer_mb: int = 100,  # Keep 100MB buffer in Seedr
     ):
         self.email = email
         self.password = password
@@ -99,15 +123,31 @@ class SeedrClientWrapper:
         self.download_path = download_path
         self.auto_download = auto_download
         self.delete_after_download = delete_after_download
+        self.storage_buffer_mb = storage_buffer_mb
+        self.storage_buffer_bytes = storage_buffer_mb * 1024 * 1024
+        
         self._client = None
         self._lock = asyncio.Lock()
         self._download_lock = asyncio.Lock()
+        self._queue_lock = asyncio.Lock()
+        
+        # Caches and state
         self._torrents_cache: dict[str, SeedrTorrent] = {}
         self._category_mapping: dict[str, str] = {}  # torrent_hash -> category
         self._download_tasks: dict[str, asyncio.Task] = {}  # torrent_hash -> download task
         self._download_progress: dict[str, float] = {}  # torrent_hash -> local download progress
         self._local_downloads: set[str] = set()  # Set of torrent hashes fully downloaded locally
-        self._active_downloads: dict[str, int] = {}  # torrent_hash -> bytes downloaded
+        self._active_downloads: dict[str, int] = {}  # torrent_hash -> bytes downloaded per second
+        
+        # Queue system for storage management
+        self._torrent_queue: deque[QueuedTorrent] = deque()
+        self._queue_counter: int = 0
+        self._queue_processing: bool = False
+        
+        # Storage info cache
+        self._storage_used: int = 0
+        self._storage_max: int = 0
+        self._last_storage_check: float = 0
 
     async def initialize(self):
         """Initialize the Seedr client."""
@@ -134,7 +174,10 @@ class SeedrClientWrapper:
             else:
                 raise ValueError("Either token or email/password required")
 
-            logger.info("Seedr client initialized successfully")
+            # Get initial storage info
+            await self._update_storage_info()
+            
+            logger.info(f"Seedr client initialized. Storage: {self._storage_used / 1024 / 1024:.1f}MB / {self._storage_max / 1024 / 1024:.1f}MB")
             return True
         except ImportError:
             logger.error("seedrcc library not installed. Run: pip install seedrcc")
@@ -163,6 +206,22 @@ class SeedrClientWrapper:
             return self._client.token.to_json()
         return None
 
+    async def _update_storage_info(self):
+        """Update cached storage information."""
+        try:
+            usage = await self._client.get_memory_bandwidth()
+            self._storage_used = getattr(usage, 'space_used', 0) or 0
+            self._storage_max = getattr(usage, 'space_max', 0) or 0
+            self._last_storage_check = datetime.now().timestamp()
+            logger.debug(f"Storage updated: {self._storage_used / 1024 / 1024:.1f}MB / {self._storage_max / 1024 / 1024:.1f}MB")
+        except Exception as e:
+            logger.warning(f"Failed to update storage info: {e}")
+
+    def get_available_storage(self) -> int:
+        """Get available storage in bytes (with buffer)."""
+        available = self._storage_max - self._storage_used - self.storage_buffer_bytes
+        return max(0, available)
+
     def _parse_progress(self, progress_str: str) -> float:
         """Parse progress string to float (0.0 to 1.0)."""
         try:
@@ -179,13 +238,17 @@ class SeedrClientWrapper:
         return self.download_path
 
     async def get_torrents(self) -> list[SeedrTorrent]:
-        """Get all torrents from Seedr."""
+        """Get all torrents from Seedr, including queued ones."""
         if not self._client:
             await self.initialize()
 
         async with self._lock:
             try:
                 torrents = []
+
+                # Update storage info periodically (every 60 seconds)
+                if datetime.now().timestamp() - self._last_storage_check > 60:
+                    await self._update_storage_info()
 
                 # Get root folder contents - includes both active torrents and completed folders
                 contents = await self._client.list_contents()
@@ -296,6 +359,27 @@ class SeedrClientWrapper:
                         torrent_hash not in self._download_tasks):
                         self._start_download_task(torrent_hash, folder.id, folder.name, save_path)
 
+                # Add queued torrents to the list
+                for queued in self._torrent_queue:
+                    queue_hash = f"QUEUE{queued.id}".upper()
+                    category = queued.category
+                    save_path = self._get_save_path(category)
+                    
+                    torrent = SeedrTorrent(
+                        id=queued.id,
+                        hash=queue_hash,
+                        name=queued.name,
+                        size=queued.estimated_size,
+                        progress=0.0,
+                        state=TorrentState.QUEUED_STORAGE,
+                        added_on=int(queued.added_time),
+                        save_path=save_path,
+                        category=category,
+                        is_queued=True,
+                    )
+                    torrents.append(torrent)
+                    self._torrents_cache[queue_hash] = torrent
+
                 return torrents
 
             except Exception as e:
@@ -374,11 +458,16 @@ class SeedrClientWrapper:
                 self._local_downloads.add(torrent_hash)
                 logger.info(f"Download complete: {folder_name}")
                 
-                # Optionally delete from Seedr
+                # Delete from Seedr after successful download (default behavior)
                 if self.delete_after_download:
                     try:
                         await self._client.delete_folder(folder_id)
                         logger.info(f"Deleted from Seedr: {folder_name}")
+                        
+                        # Update storage info and process queue
+                        await self._update_storage_info()
+                        await self._process_queue()
+                        
                     except Exception as e:
                         logger.warning(f"Failed to delete from Seedr: {e}")
                 
@@ -442,7 +531,7 @@ class SeedrClientWrapper:
         category: str = "",
     ) -> Optional[str]:
         """
-        Add a torrent to Seedr.
+        Add a torrent to Seedr or queue if storage is full.
         Returns the torrent hash if successful.
         """
         if not self._client:
@@ -450,12 +539,55 @@ class SeedrClientWrapper:
 
         async with self._lock:
             try:
+                # Update storage info
+                await self._update_storage_info()
+                
+                # Extract name from magnet link if possible
+                name = "Unknown Torrent"
+                estimated_size = 0
+                
                 if magnet_link:
-                    result = await self._client.add_torrent(magnet_link=magnet_link)
-                elif torrent_file:
-                    result = await self._client.add_torrent(torrent_file=torrent_file)
-                else:
-                    raise ValueError("Either magnet_link or torrent_file required")
+                    # Try to extract name from magnet link
+                    parsed = urllib.parse.urlparse(magnet_link)
+                    params = urllib.parse.parse_qs(parsed.query)
+                    if 'dn' in params:
+                        name = urllib.parse.unquote(params['dn'][0])
+                    # Try to get size hint from xl parameter
+                    if 'xl' in params:
+                        try:
+                            estimated_size = int(params['xl'][0])
+                        except ValueError:
+                            pass
+                
+                # Check if we have enough storage (use 500MB as default estimate if unknown)
+                check_size = estimated_size if estimated_size > 0 else 500 * 1024 * 1024
+                available = self.get_available_storage()
+                
+                # If queue has items, add to queue to maintain order
+                if len(self._torrent_queue) > 0:
+                    logger.info(f"Queue not empty, adding to queue: {name}")
+                    return await self._add_to_queue(magnet_link, torrent_file, category, name, estimated_size)
+                
+                # Check if we have storage space
+                if available < check_size:
+                    logger.warning(f"Insufficient Seedr storage ({available / 1024 / 1024:.1f}MB available), queuing: {name}")
+                    return await self._add_to_queue(magnet_link, torrent_file, category, name, estimated_size)
+                
+                # Try to add to Seedr
+                try:
+                    if magnet_link:
+                        result = await self._client.add_torrent(magnet_link=magnet_link)
+                    elif torrent_file:
+                        result = await self._client.add_torrent(torrent_file=torrent_file)
+                    else:
+                        raise ValueError("Either magnet_link or torrent_file required")
+                except Exception as e:
+                    error_str = str(e).lower()
+                    # Check if it's a storage error
+                    if 'space' in error_str or 'storage' in error_str or 'limit' in error_str or 'full' in error_str:
+                        logger.warning(f"Seedr storage full, queuing: {name}")
+                        return await self._add_to_queue(magnet_link, torrent_file, category, name, estimated_size)
+                    raise
 
                 # Get the transfer info from result
                 torrent_hash = None
@@ -466,7 +598,7 @@ class SeedrClientWrapper:
                 else:
                     torrent_hash = f"SEEDR{id(result)}"
 
-                name = getattr(result, 'name', f"torrent_{torrent_hash}")
+                name = getattr(result, 'name', name)
                 
                 # Store category mapping
                 if category:
@@ -482,15 +614,131 @@ class SeedrClientWrapper:
                 logger.error(f"Error adding torrent: {e}")
                 raise
 
+    async def _add_to_queue(
+        self,
+        magnet_link: Optional[str],
+        torrent_file: Optional[bytes],
+        category: str,
+        name: str,
+        estimated_size: int,
+    ) -> str:
+        """Add a torrent to the queue."""
+        async with self._queue_lock:
+            self._queue_counter += 1
+            queue_id = f"{self._queue_counter:08d}"
+            
+            queued = QueuedTorrent(
+                id=queue_id,
+                magnet_link=magnet_link,
+                torrent_file=torrent_file,
+                category=category,
+                name=name,
+                estimated_size=estimated_size,
+            )
+            
+            self._torrent_queue.append(queued)
+            logger.info(f"Queued torrent #{queue_id}: {name} (queue size: {len(self._torrent_queue)})")
+            
+            # Store category mapping for queued item
+            queue_hash = f"QUEUE{queue_id}".upper()
+            if category:
+                self._category_mapping[queue_hash] = category
+            
+            return queue_hash
+
+    async def _process_queue(self):
+        """Process queued torrents if storage is available."""
+        if self._queue_processing:
+            return
+        
+        self._queue_processing = True
+        try:
+            async with self._queue_lock:
+                while self._torrent_queue:
+                    # Update storage info
+                    await self._update_storage_info()
+                    available = self.get_available_storage()
+                    
+                    # Check next item in queue
+                    queued = self._torrent_queue[0]
+                    check_size = queued.estimated_size if queued.estimated_size > 0 else 500 * 1024 * 1024
+                    
+                    if available < check_size:
+                        logger.debug(f"Not enough storage for queue item: {queued.name}")
+                        break
+                    
+                    # Remove from queue and try to add
+                    self._torrent_queue.popleft()
+                    queue_hash = f"QUEUE{queued.id}".upper()
+                    
+                    try:
+                        logger.info(f"Processing queued torrent: {queued.name}")
+                        
+                        if queued.magnet_link:
+                            result = await self._client.add_torrent(magnet_link=queued.magnet_link)
+                        elif queued.torrent_file:
+                            result = await self._client.add_torrent(torrent_file=queued.torrent_file)
+                        else:
+                            logger.error(f"Queued torrent has no magnet or file: {queued.id}")
+                            continue
+                        
+                        # Get the new hash
+                        torrent_hash = None
+                        if hasattr(result, 'hash') and result.hash:
+                            torrent_hash = result.hash.upper()
+                        elif hasattr(result, 'id'):
+                            torrent_hash = f"SEEDR{result.id}"
+                        
+                        # Transfer category mapping
+                        if queued.category:
+                            self._category_mapping[torrent_hash] = queued.category
+                            cat_path = os.path.join(self.download_path, queued.category)
+                            os.makedirs(cat_path, exist_ok=True)
+                        
+                        # Clean up queue hash mapping
+                        self._category_mapping.pop(queue_hash, None)
+                        self._torrents_cache.pop(queue_hash, None)
+                        
+                        logger.info(f"Queued torrent added to Seedr: {queued.name} -> {torrent_hash}")
+                        
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if 'space' in error_str or 'storage' in error_str or 'limit' in error_str:
+                            # Put back in queue
+                            self._torrent_queue.appendleft(queued)
+                            logger.warning(f"Still not enough storage, re-queued: {queued.name}")
+                            break
+                        else:
+                            logger.error(f"Failed to add queued torrent: {e}")
+                    
+                    # Small delay between queue items
+                    await asyncio.sleep(1)
+                    
+        finally:
+            self._queue_processing = False
+
     async def delete_torrent(
         self, torrent_hash: str, delete_files: bool = False
     ) -> bool:
-        """Delete a torrent from Seedr."""
+        """Delete a torrent from Seedr or queue."""
         if not self._client:
             await self.initialize()
 
         async with self._lock:
             try:
+                # Check if it's a queued torrent
+                if torrent_hash.startswith("QUEUE"):
+                    queue_id = torrent_hash.replace("QUEUE", "")
+                    async with self._queue_lock:
+                        for i, queued in enumerate(list(self._torrent_queue)):
+                            if queued.id == queue_id:
+                                del self._torrent_queue[i]
+                                self._category_mapping.pop(torrent_hash, None)
+                                self._torrents_cache.pop(torrent_hash, None)
+                                logger.info(f"Removed from queue: {queued.name}")
+                                return True
+                    return False
+                
                 # Cancel any active download
                 if torrent_hash in self._download_tasks:
                     self._download_tasks[torrent_hash].cancel()
@@ -502,14 +750,20 @@ class SeedrClientWrapper:
                     logger.warning(f"Torrent not found in cache: {torrent_hash}")
                     return False
 
-                # Delete from Seedr (if still there)
-                try:
-                    if torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
-                        await self._client.delete_folder(torrent.id)
-                    else:
-                        await self._client.delete_torrent(torrent.id)
-                except Exception as e:
-                    logger.warning(f"Could not delete from Seedr (may already be deleted): {e}")
+                # Delete from Seedr (if still there and not already locally downloaded and deleted)
+                if torrent_hash not in self._local_downloads or not self.delete_after_download:
+                    try:
+                        if torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
+                            await self._client.delete_folder(torrent.id)
+                        else:
+                            await self._client.delete_torrent(torrent.id)
+                        
+                        # Update storage and process queue
+                        await self._update_storage_info()
+                        await self._process_queue()
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not delete from Seedr (may already be deleted): {e}")
                 
                 # Delete local files if requested
                 if delete_files and torrent.content_path:
@@ -547,6 +801,10 @@ class SeedrClientWrapper:
 
         torrent = self._torrents_cache.get(torrent_hash)
         if not torrent:
+            return []
+
+        # Queued torrents have no files yet
+        if torrent.is_queued:
             return []
 
         # Only completed folders have files we can list
@@ -611,14 +869,15 @@ class SeedrClientWrapper:
 
         try:
             settings = await self._client.get_settings()
-            usage = await self._client.get_memory_bandwidth()
+            await self._update_storage_info()
             
             return {
                 "username": settings.account.username,
                 "email": settings.account.email,
-                "space_used": getattr(usage, 'space_used', 0) or 0,
-                "space_max": getattr(usage, 'space_max', 0) or 0,
-                "bandwidth_used": getattr(usage, 'bandwidth_used', 0) or 0,
+                "space_used": self._storage_used,
+                "space_max": self._storage_max,
+                "space_available": self.get_available_storage(),
+                "queue_size": len(self._torrent_queue),
             }
         except Exception as e:
             logger.error(f"Error getting settings: {e}")
@@ -631,7 +890,12 @@ class SeedrClientWrapper:
                 await self.initialize()
             
             settings = await self._client.get_settings()
-            return True, f"Connected as {settings.account.username}"
+            await self._update_storage_info()
+            
+            storage_pct = (self._storage_used / self._storage_max * 100) if self._storage_max > 0 else 0
+            queue_info = f", {len(self._torrent_queue)} queued" if self._torrent_queue else ""
+            
+            return True, f"Connected as {settings.account.username} ({storage_pct:.1f}% storage used{queue_info})"
         except Exception as e:
             return False, str(e)
 
@@ -640,6 +904,9 @@ class SeedrClientWrapper:
         torrent = self._torrents_cache.get(torrent_hash)
         if not torrent:
             return False
+        
+        if torrent.is_queued:
+            return False  # Can't download queued torrents
         
         if torrent_hash in self._download_tasks:
             return True  # Already downloading
@@ -654,3 +921,32 @@ class SeedrClientWrapper:
             torrent.save_path
         )
         return True
+
+    def get_queue_info(self) -> list[dict]:
+        """Get information about queued torrents."""
+        return [
+            {
+                "id": q.id,
+                "name": q.name,
+                "category": q.category,
+                "estimated_size": q.estimated_size,
+                "added_time": q.added_time,
+                "position": i + 1,
+            }
+            for i, q in enumerate(self._torrent_queue)
+        ]
+
+    async def clear_queue(self) -> int:
+        """Clear all queued torrents. Returns count of removed items."""
+        async with self._queue_lock:
+            count = len(self._torrent_queue)
+            
+            # Clean up category mappings
+            for queued in self._torrent_queue:
+                queue_hash = f"QUEUE{queued.id}".upper()
+                self._category_mapping.pop(queue_hash, None)
+                self._torrents_cache.pop(queue_hash, None)
+            
+            self._torrent_queue.clear()
+            logger.info(f"Cleared {count} items from queue")
+            return count

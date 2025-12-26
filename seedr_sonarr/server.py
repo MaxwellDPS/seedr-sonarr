@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     
     # Auto-download from Seedr to local storage
     auto_download: bool = True  # Automatically download completed torrents
-    delete_after_download: bool = False  # Delete from Seedr after download completes
+    delete_after_download: bool = True  # Delete from Seedr after download completes (frees storage for queue)
 
     # Logging
     log_level: str = "INFO"
@@ -1088,6 +1088,92 @@ async def get_seedr_settings(request: Request):
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Queue Management Endpoints (Custom)
+# =============================================================================
+
+
+@app.get("/api/seedr/queue")
+async def get_queue(request: Request):
+    """Get the queue of torrents waiting for Seedr storage."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    queue_info = seedr_client.get_queue_info()
+    available_storage = seedr_client.get_available_storage()
+    
+    return JSONResponse({
+        "queue_size": len(queue_info),
+        "available_storage_mb": available_storage / 1024 / 1024,
+        "storage_used_mb": seedr_client._storage_used / 1024 / 1024,
+        "storage_max_mb": seedr_client._storage_max / 1024 / 1024,
+        "queue": queue_info,
+    })
+
+
+@app.post("/api/seedr/queue/clear")
+async def clear_queue(request: Request):
+    """Clear all queued torrents."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    count = await seedr_client.clear_queue()
+    
+    return JSONResponse({
+        "cleared": count,
+        "message": f"Cleared {count} torrents from queue",
+    })
+
+
+@app.post("/api/seedr/queue/process")
+async def process_queue(request: Request):
+    """Force process the queue (try to add queued torrents to Seedr)."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    initial_size = len(seedr_client._torrent_queue)
+    await seedr_client._process_queue()
+    final_size = len(seedr_client._torrent_queue)
+    
+    return JSONResponse({
+        "processed": initial_size - final_size,
+        "remaining": final_size,
+        "message": f"Processed {initial_size - final_size} torrents, {final_size} remaining in queue",
+    })
+
+
+@app.get("/api/seedr/storage")
+async def get_storage(request: Request):
+    """Get Seedr storage information."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    await seedr_client._update_storage_info()
+    
+    return JSONResponse({
+        "used_bytes": seedr_client._storage_used,
+        "max_bytes": seedr_client._storage_max,
+        "available_bytes": seedr_client.get_available_storage(),
+        "used_mb": seedr_client._storage_used / 1024 / 1024,
+        "max_mb": seedr_client._storage_max / 1024 / 1024,
+        "available_mb": seedr_client.get_available_storage() / 1024 / 1024,
+        "used_percent": (seedr_client._storage_used / seedr_client._storage_max * 100) if seedr_client._storage_max > 0 else 0,
+        "buffer_mb": seedr_client.storage_buffer_mb,
+    })
 
 
 # =============================================================================
