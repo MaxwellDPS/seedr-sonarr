@@ -991,17 +991,41 @@ async def get_download_status(request: Request):
     downloads = []
     
     for torrent_hash, torrent in seedr_client._torrents_cache.items():
+        # Skip mapped duplicates (queue hashes that point to real torrents)
+        if torrent_hash.startswith("QUEUE") and torrent_hash in seedr_client._hash_mapping:
+            continue
+            
         is_downloading = torrent_hash in seedr_client._download_tasks
         is_completed = torrent_hash in seedr_client._local_downloads
-        progress = seedr_client._download_progress.get(torrent_hash, 0.0)
+        local_progress = seedr_client._download_progress.get(torrent_hash, 0.0)
         speed = seedr_client._active_downloads.get(torrent_hash, 0)
+        
+        # Determine Seedr progress (0-100% of the Seedr phase)
+        if torrent.is_queued:
+            seedr_progress = 0.0
+            phase = "queued"
+        elif torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
+            seedr_progress = 1.0
+            phase = "seedr_complete"
+        else:
+            # Active transfer - progress is already 0-50%, so multiply by 2 to get 0-100%
+            seedr_progress = min(torrent.progress * 2, 1.0)
+            phase = "downloading_to_seedr"
+        
+        # Update phase based on local download status
+        if is_completed:
+            phase = "complete"
+        elif is_downloading:
+            phase = "downloading_to_local"
         
         downloads.append({
             "hash": torrent_hash,
             "name": torrent.name,
             "size": torrent.size,
-            "seedr_progress": 1.0 if torrent.state.value == "pausedUP" else torrent.progress,
-            "local_progress": progress,
+            "phase": phase,
+            "seedr_progress": seedr_progress,  # 0-100% of internet->Seedr
+            "local_progress": local_progress,   # 0-100% of Seedr->local
+            "combined_progress": torrent.progress,  # 0-100% overall (what Sonarr sees)
             "local_speed": speed,
             "is_downloading_locally": is_downloading,
             "is_completed_locally": is_completed,

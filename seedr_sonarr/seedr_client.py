@@ -144,6 +144,9 @@ class SeedrClientWrapper:
         self._queue_counter: int = 0
         self._queue_processing: bool = False
         
+        # Hash mapping: queue_hash -> real_hash (for Sonarr tracking)
+        self._hash_mapping: dict[str, str] = {}
+        
         # Storage info cache
         self._storage_used: int = 0
         self._storage_max: int = 0
@@ -253,19 +256,19 @@ class SeedrClientWrapper:
                 # Get root folder contents - includes both active torrents and completed folders
                 contents = await self._client.list_contents()
 
-                # Process active torrents (downloading in Seedr)
+                # Process active torrents (downloading in Seedr from internet)
                 for transfer in contents.torrents:
                     torrent_hash = transfer.hash.upper() if transfer.hash else f"SEEDR{transfer.id}"
                     
-                    # Parse progress
-                    progress = self._parse_progress(transfer.progress)
+                    # Parse progress (this is internet -> Seedr progress)
+                    seedr_progress = self._parse_progress(transfer.progress)
                     
                     # Determine state based on progress and stopped flag
                     if getattr(transfer, 'stopped', 0):
                         state = TorrentState.PAUSED
-                    elif progress >= 1.0:
+                    elif seedr_progress >= 1.0:
                         state = TorrentState.COMPLETED
-                    elif progress > 0:
+                    elif seedr_progress > 0:
                         state = TorrentState.DOWNLOADING
                     else:
                         state = TorrentState.QUEUED
@@ -273,12 +276,16 @@ class SeedrClientWrapper:
                     size = transfer.size or 0
                     category = self._category_mapping.get(torrent_hash, "")
                     
+                    # Progress: 0-50% represents internet -> Seedr
+                    # So multiply Seedr progress by 0.5
+                    effective_progress = seedr_progress * 0.5
+                    
                     torrent = SeedrTorrent(
                         id=str(transfer.id),
                         hash=torrent_hash,
                         name=transfer.name,
                         size=size,
-                        progress=progress,
+                        progress=effective_progress,
                         state=state,
                         download_speed=getattr(transfer, 'download_rate', 0) or 0,
                         upload_speed=getattr(transfer, 'upload_rate', 0) or 0,
@@ -287,13 +294,13 @@ class SeedrClientWrapper:
                         added_on=int(datetime.now().timestamp()),
                         save_path=self._get_save_path(category),
                         category=category,
-                        downloaded=int(size * progress),
-                        completed=int(size * progress),
+                        downloaded=int(size * effective_progress),
+                        completed=int(size * effective_progress),
                     )
                     torrents.append(torrent)
                     self._torrents_cache[torrent_hash] = torrent
 
-                # Process completed folders (finished downloads in Seedr)
+                # Process completed folders (finished in Seedr, may need local download)
                 for folder in contents.folders:
                     # Generate a consistent hash from folder ID
                     torrent_hash = f"SEEDR{folder.id:016X}".upper()
@@ -318,14 +325,20 @@ class SeedrClientWrapper:
                     else:
                         state = TorrentState.COMPLETED
                     
-                    # Calculate effective progress (Seedr progress + local download progress)
-                    # Seedr download is 50%, local download is 50%
+                    # Progress calculation:
+                    # 0-50% = internet -> Seedr (complete for folders)
+                    # 50-100% = Seedr -> local
                     if is_local:
+                        # Fully downloaded locally
                         effective_progress = 1.0
                     elif torrent_hash in self._download_tasks:
+                        # Currently downloading from Seedr to local
+                        # 50% + (local_progress * 50%)
                         effective_progress = 0.5 + (local_progress * 0.5)
                     else:
-                        effective_progress = 0.5  # Seedr download complete, local not started
+                        # In Seedr but not started local download yet
+                        # Show 50% (Seedr download complete)
+                        effective_progress = 0.5
                     
                     # Use local download speed if actively downloading
                     download_speed = 0
@@ -379,6 +392,33 @@ class SeedrClientWrapper:
                     )
                     torrents.append(torrent)
                     self._torrents_cache[queue_hash] = torrent
+
+                # Add entries for mapped queue hashes (so Sonarr can find them by original hash)
+                for queue_hash, real_hash in self._hash_mapping.items():
+                    if real_hash in self._torrents_cache and queue_hash not in self._torrents_cache:
+                        real_torrent = self._torrents_cache[real_hash]
+                        # Create a copy with the queue hash
+                        mapped_torrent = SeedrTorrent(
+                            id=real_torrent.id,
+                            hash=queue_hash,  # Use queue hash so Sonarr finds it
+                            name=real_torrent.name,
+                            size=real_torrent.size,
+                            progress=real_torrent.progress,
+                            state=real_torrent.state,
+                            download_speed=real_torrent.download_speed,
+                            upload_speed=real_torrent.upload_speed,
+                            added_on=real_torrent.added_on,
+                            completion_on=real_torrent.completion_on,
+                            save_path=real_torrent.save_path,
+                            content_path=real_torrent.content_path,
+                            category=real_torrent.category,
+                            downloaded=real_torrent.downloaded,
+                            completed=real_torrent.completed,
+                            local_progress=real_torrent.local_progress,
+                            is_local=real_torrent.is_local,
+                        )
+                        torrents.append(mapped_torrent)
+                        self._torrents_cache[queue_hash] = mapped_torrent
 
                 return torrents
 
@@ -683,23 +723,28 @@ class SeedrClientWrapper:
                             continue
                         
                         # Get the new hash
-                        torrent_hash = None
+                        real_hash = None
                         if hasattr(result, 'hash') and result.hash:
-                            torrent_hash = result.hash.upper()
+                            real_hash = result.hash.upper()
                         elif hasattr(result, 'id'):
-                            torrent_hash = f"SEEDR{result.id}"
+                            real_hash = f"SEEDR{result.id}"
                         
-                        # Transfer category mapping
+                        # Store hash mapping so Sonarr can still track by queue hash
+                        if real_hash:
+                            self._hash_mapping[queue_hash] = real_hash
+                            logger.info(f"Hash mapping: {queue_hash} -> {real_hash}")
+                        
+                        # Transfer category mapping to real hash
                         if queued.category:
-                            self._category_mapping[torrent_hash] = queued.category
+                            self._category_mapping[real_hash] = queued.category
                             cat_path = os.path.join(self.download_path, queued.category)
                             os.makedirs(cat_path, exist_ok=True)
                         
-                        # Clean up queue hash mapping
-                        self._category_mapping.pop(queue_hash, None)
+                        # Keep queue hash category mapping for lookups
+                        # Don't remove it: self._category_mapping.pop(queue_hash, None)
                         self._torrents_cache.pop(queue_hash, None)
                         
-                        logger.info(f"Queued torrent added to Seedr: {queued.name} -> {torrent_hash}")
+                        logger.info(f"Queued torrent added to Seedr: {queued.name} -> {real_hash}")
                         
                     except Exception as e:
                         error_str = str(e).lower()
@@ -726,7 +771,9 @@ class SeedrClientWrapper:
 
         async with self._lock:
             try:
-                # Check if it's a queued torrent
+                torrent_hash = torrent_hash.upper()
+                
+                # Check if it's a queued torrent (still in queue)
                 if torrent_hash.startswith("QUEUE"):
                     queue_id = torrent_hash.replace("QUEUE", "")
                     async with self._queue_lock:
@@ -737,21 +784,34 @@ class SeedrClientWrapper:
                                 self._torrents_cache.pop(torrent_hash, None)
                                 logger.info(f"Removed from queue: {queued.name}")
                                 return True
-                    return False
+                    
+                    # Not in queue - might be mapped to a real hash
+                    if torrent_hash in self._hash_mapping:
+                        real_hash = self._hash_mapping[torrent_hash]
+                        # Continue with deletion using real hash
+                        torrent_hash_to_delete = real_hash
+                    else:
+                        return False
+                else:
+                    torrent_hash_to_delete = torrent_hash
+                
+                # Resolve hash mapping
+                real_hash = self._hash_mapping.get(torrent_hash, torrent_hash)
+                torrent_hash_to_delete = real_hash
                 
                 # Cancel any active download
-                if torrent_hash in self._download_tasks:
-                    self._download_tasks[torrent_hash].cancel()
-                    del self._download_tasks[torrent_hash]
+                if torrent_hash_to_delete in self._download_tasks:
+                    self._download_tasks[torrent_hash_to_delete].cancel()
+                    del self._download_tasks[torrent_hash_to_delete]
                 
                 # Find the torrent by hash
-                torrent = self._torrents_cache.get(torrent_hash)
+                torrent = self._torrents_cache.get(torrent_hash_to_delete)
                 if not torrent:
-                    logger.warning(f"Torrent not found in cache: {torrent_hash}")
+                    logger.warning(f"Torrent not found in cache: {torrent_hash_to_delete}")
                     return False
 
                 # Delete from Seedr (if still there and not already locally downloaded and deleted)
-                if torrent_hash not in self._local_downloads or not self.delete_after_download:
+                if torrent_hash_to_delete not in self._local_downloads or not self.delete_after_download:
                     try:
                         if torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
                             await self._client.delete_folder(torrent.id)
@@ -775,11 +835,22 @@ class SeedrClientWrapper:
                     except Exception as e:
                         logger.warning(f"Could not delete local files: {e}")
                 
-                # Clean up local cache
-                self._torrents_cache.pop(torrent_hash, None)
+                # Clean up local cache and mappings
+                self._torrents_cache.pop(torrent_hash_to_delete, None)
+                self._torrents_cache.pop(torrent_hash, None)  # Also remove original hash if different
+                self._category_mapping.pop(torrent_hash_to_delete, None)
                 self._category_mapping.pop(torrent_hash, None)
-                self._download_progress.pop(torrent_hash, None)
-                self._local_downloads.discard(torrent_hash)
+                self._download_progress.pop(torrent_hash_to_delete, None)
+                self._local_downloads.discard(torrent_hash_to_delete)
+                
+                # Clean up hash mapping
+                if torrent_hash in self._hash_mapping:
+                    del self._hash_mapping[torrent_hash]
+                # Also clean up reverse mapping
+                keys_to_remove = [k for k, v in self._hash_mapping.items() if v == torrent_hash_to_delete]
+                for k in keys_to_remove:
+                    del self._hash_mapping[k]
+                    self._torrents_cache.pop(k, None)
 
                 logger.info(f"Deleted torrent: {torrent.name}")
                 return True
@@ -792,14 +863,29 @@ class SeedrClientWrapper:
         """Get a specific torrent by hash."""
         # Refresh cache
         await self.get_torrents()
-        return self._torrents_cache.get(torrent_hash)
+        
+        # Check if this is a mapped queue hash
+        real_hash = self._hash_mapping.get(torrent_hash.upper(), torrent_hash.upper())
+        
+        torrent = self._torrents_cache.get(real_hash)
+        
+        # If found via mapping, return with original hash so Sonarr stays happy
+        if torrent and real_hash != torrent_hash.upper():
+            # Create a copy with the original hash
+            from dataclasses import replace
+            torrent = replace(torrent, hash=torrent_hash.upper())
+        
+        return torrent
 
     async def get_torrent_files(self, torrent_hash: str) -> list[dict]:
         """Get files for a specific torrent."""
         if not self._client:
             await self.initialize()
 
-        torrent = self._torrents_cache.get(torrent_hash)
+        # Resolve hash mapping
+        real_hash = self._hash_mapping.get(torrent_hash.upper(), torrent_hash.upper())
+        torrent = self._torrents_cache.get(real_hash)
+        
         if not torrent:
             return []
 
@@ -901,21 +987,26 @@ class SeedrClientWrapper:
 
     async def force_download(self, torrent_hash: str) -> bool:
         """Force start downloading a torrent to local storage."""
-        torrent = self._torrents_cache.get(torrent_hash)
+        torrent_hash = torrent_hash.upper()
+        
+        # Resolve hash mapping
+        real_hash = self._hash_mapping.get(torrent_hash, torrent_hash)
+        
+        torrent = self._torrents_cache.get(real_hash)
         if not torrent:
             return False
         
         if torrent.is_queued:
             return False  # Can't download queued torrents
         
-        if torrent_hash in self._download_tasks:
+        if real_hash in self._download_tasks:
             return True  # Already downloading
         
-        if torrent_hash in self._local_downloads:
+        if real_hash in self._local_downloads:
             return True  # Already downloaded
         
         self._start_download_task(
-            torrent_hash, 
+            real_hash, 
             int(torrent.id), 
             torrent.name, 
             torrent.save_path
