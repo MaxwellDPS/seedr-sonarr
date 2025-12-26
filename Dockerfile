@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Seedr-Sonarr Proxy Dockerfile
 # Multi-stage build for smaller image size
 # Supports: linux/amd64, linux/arm64
@@ -18,25 +19,36 @@ WORKDIR /app
 
 # Install build dependencies
 # Note: gcc is needed for some Python packages with C extensions
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libffi-dev
 
 # Create virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip wheel setuptools
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip wheel setuptools
 
-# Copy and install dependencies
-COPY pyproject.toml .
+# Copy pyproject.toml first for better layer caching
+COPY pyproject.toml README.md ./
+
+# Create a minimal __init__.py so pip install works for dependencies
+RUN mkdir -p seedr_sonarr && echo '"""Seedr-Sonarr Proxy"""' > seedr_sonarr/__init__.py
+
+# Install dependencies (this layer is cached if pyproject.toml doesn't change)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install .
+
+# Now copy the actual source code
 COPY seedr_sonarr/ seedr_sonarr/
-COPY README.md .
 
-# Install the package
-RUN pip install --no-cache-dir .
+# Reinstall to update with actual source (uses cached dependencies)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps .
 
 # =============================================================================
 # Runtime stage
