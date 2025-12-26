@@ -10,7 +10,6 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-import hashlib
 import os
 import aiohttp
 import aiofiles
@@ -95,9 +94,12 @@ class SeedrClientWrapper:
                     self._client = AsyncSeedr(token=token_obj)
                 except Exception:
                     # Token might be just the access token string
-                    self._client = await AsyncSeedr.from_password(
-                        self.email, self.password
-                    )
+                    if self.email and self.password:
+                        self._client = await AsyncSeedr.from_password(
+                            self.email, self.password
+                        )
+                    else:
+                        raise ValueError("Invalid token and no email/password provided")
             elif self.email and self.password:
                 self._client = await AsyncSeedr.from_password(
                     self.email, self.password
@@ -117,7 +119,10 @@ class SeedrClientWrapper:
     async def close(self):
         """Close the client connection."""
         if self._client:
-            await self._client.__aexit__(None, None, None)
+            try:
+                await self._client.close()
+            except Exception:
+                pass
             self._client = None
 
     async def get_token(self) -> Optional[str]:
@@ -126,11 +131,14 @@ class SeedrClientWrapper:
             return self._client.token.to_json()
         return None
 
-    def _generate_hash(self, torrent_id: str, name: str) -> str:
-        """Generate a consistent hash for a torrent."""
-        # Create a hash that looks like a real torrent hash
-        data = f"{torrent_id}:{name}".encode()
-        return hashlib.sha1(data).hexdigest().upper()
+    def _parse_progress(self, progress_str: str) -> float:
+        """Parse progress string to float (0.0 to 1.0)."""
+        try:
+            # Progress might be "50" or "50%" or "50.5"
+            progress = float(str(progress_str).replace('%', '').strip())
+            return progress / 100.0 if progress > 1 else progress
+        except (ValueError, TypeError):
+            return 0.0
 
     async def get_torrents(self) -> list[SeedrTorrent]:
         """Get all torrents from Seedr."""
@@ -141,77 +149,73 @@ class SeedrClientWrapper:
             try:
                 torrents = []
 
-                # Get active transfers (downloading)
-                try:
-                    transfers = await self._client.list_active_transfers()
-                    for transfer in transfers:
-                        torrent_hash = self._generate_hash(
-                            str(transfer.id), transfer.name
-                        )
-                        
-                        # Determine state based on transfer status
-                        if hasattr(transfer, 'progress'):
-                            progress = transfer.progress or 0
-                        else:
-                            progress = 0
+                # Get root folder contents - includes both active torrents and completed folders
+                contents = await self._client.list_contents()
 
-                        if progress >= 100:
-                            state = TorrentState.COMPLETED
-                        elif progress > 0:
-                            state = TorrentState.DOWNLOADING
-                        else:
-                            state = TorrentState.QUEUED
+                # Process active torrents (downloading)
+                for transfer in contents.torrents:
+                    torrent_hash = transfer.hash.upper() if transfer.hash else f"SEEDR{transfer.id}"
+                    
+                    # Parse progress
+                    progress = self._parse_progress(transfer.progress)
+                    
+                    # Determine state based on progress and stopped flag
+                    if getattr(transfer, 'stopped', 0):
+                        state = TorrentState.PAUSED
+                    elif progress >= 1.0:
+                        state = TorrentState.COMPLETED
+                    elif progress > 0:
+                        state = TorrentState.DOWNLOADING
+                    else:
+                        state = TorrentState.QUEUED
 
-                        size = getattr(transfer, 'size', 0) or 0
-                        
-                        torrent = SeedrTorrent(
-                            id=str(transfer.id),
-                            hash=torrent_hash,
-                            name=transfer.name,
-                            size=size,
-                            progress=progress / 100.0,
-                            state=state,
-                            download_speed=getattr(transfer, 'speed', 0) or 0,
-                            added_on=int(datetime.now().timestamp()),
-                            save_path=self.download_path,
-                            category=self._category_mapping.get(torrent_hash, ""),
-                            downloaded=int(size * progress / 100),
-                            completed=int(size * progress / 100),
-                        )
-                        torrents.append(torrent)
-                        self._torrents_cache[torrent_hash] = torrent
-                except Exception as e:
-                    logger.debug(f"No active transfers or error: {e}")
+                    size = transfer.size or 0
+                    
+                    torrent = SeedrTorrent(
+                        id=str(transfer.id),
+                        hash=torrent_hash,
+                        name=transfer.name,
+                        size=size,
+                        progress=progress,
+                        state=state,
+                        download_speed=getattr(transfer, 'download_rate', 0) or 0,
+                        upload_speed=getattr(transfer, 'upload_rate', 0) or 0,
+                        seeders=getattr(transfer, 'seeders', 0) or 0,
+                        leechers=getattr(transfer, 'leechers', 0) or 0,
+                        added_on=int(datetime.now().timestamp()),
+                        save_path=self.download_path,
+                        category=self._category_mapping.get(torrent_hash, ""),
+                        downloaded=int(size * progress),
+                        completed=int(size * progress),
+                    )
+                    torrents.append(torrent)
+                    self._torrents_cache[torrent_hash] = torrent
 
-                # Get completed folders (finished downloads)
-                try:
-                    folder = await self._client.list_folder()
-                    for item in folder.folders:
-                        torrent_hash = self._generate_hash(str(item.id), item.name)
-                        
-                        torrent = SeedrTorrent(
-                            id=str(item.id),
-                            hash=torrent_hash,
-                            name=item.name,
-                            size=item.size,
-                            progress=1.0,
-                            state=TorrentState.COMPLETED,
-                            added_on=int(
-                                item.created_at.timestamp()
-                                if hasattr(item, 'created_at') and item.created_at
-                                else datetime.now().timestamp()
-                            ),
-                            completion_on=int(datetime.now().timestamp()),
-                            save_path=self.download_path,
-                            content_path=os.path.join(self.download_path, item.name),
-                            category=self._category_mapping.get(torrent_hash, ""),
-                            downloaded=item.size,
-                            completed=item.size,
-                        )
-                        torrents.append(torrent)
-                        self._torrents_cache[torrent_hash] = torrent
-                except Exception as e:
-                    logger.error(f"Error listing folders: {e}")
+                # Process completed folders (finished downloads)
+                for folder in contents.folders:
+                    # Generate a consistent hash from folder ID
+                    torrent_hash = f"SEEDR{folder.id:016X}".upper()
+                    
+                    last_update = folder.last_update
+                    timestamp = int(last_update.timestamp()) if last_update else int(datetime.now().timestamp())
+                    
+                    torrent = SeedrTorrent(
+                        id=str(folder.id),
+                        hash=torrent_hash,
+                        name=folder.name,
+                        size=folder.size,
+                        progress=1.0,
+                        state=TorrentState.COMPLETED,
+                        added_on=timestamp,
+                        completion_on=timestamp,
+                        save_path=self.download_path,
+                        content_path=os.path.join(self.download_path, folder.name),
+                        category=self._category_mapping.get(torrent_hash, ""),
+                        downloaded=folder.size,
+                        completed=folder.size,
+                    )
+                    torrents.append(torrent)
+                    self._torrents_cache[torrent_hash] = torrent
 
                 return torrents
 
@@ -241,12 +245,18 @@ class SeedrClientWrapper:
                 else:
                     raise ValueError("Either magnet_link or torrent_file required")
 
-                # Get the transfer ID from result
-                transfer_id = str(result.id) if hasattr(result, 'id') else str(result)
-                name = getattr(result, 'name', f"torrent_{transfer_id}")
+                # Get the transfer info from result
+                torrent_hash = None
+                if hasattr(result, 'hash') and result.hash:
+                    torrent_hash = result.hash.upper()
+                elif hasattr(result, 'id'):
+                    torrent_hash = f"SEEDR{result.id}"
+                else:
+                    torrent_hash = f"SEEDR{id(result)}"
+
+                name = getattr(result, 'name', f"torrent_{torrent_hash}")
                 
-                # Generate hash and store category mapping
-                torrent_hash = self._generate_hash(transfer_id, name)
+                # Store category mapping
                 if category:
                     self._category_mapping[torrent_hash] = category
 
@@ -272,8 +282,11 @@ class SeedrClientWrapper:
                     logger.warning(f"Torrent not found in cache: {torrent_hash}")
                     return False
 
-                # Delete from Seedr
-                await self._client.delete_item(torrent.id, 'folder')
+                # Determine if it's an active torrent or completed folder
+                if torrent.state == TorrentState.COMPLETED:
+                    await self._client.delete_folder(torrent.id)
+                else:
+                    await self._client.delete_torrent(torrent.id)
                 
                 # Clean up local cache
                 self._torrents_cache.pop(torrent_hash, None)
@@ -301,8 +314,12 @@ class SeedrClientWrapper:
         if not torrent:
             return []
 
+        # Only completed folders have files we can list
+        if torrent.state != TorrentState.COMPLETED:
+            return []
+
         try:
-            folder = await self._client.list_folder(torrent.id)
+            folder = await self._client.list_contents(str(torrent.id))
             files = []
             
             for idx, file in enumerate(folder.files):
@@ -310,7 +327,7 @@ class SeedrClientWrapper:
                     "index": idx,
                     "name": file.name,
                     "size": file.size,
-                    "progress": 1.0 if torrent.state == TorrentState.COMPLETED else torrent.progress,
+                    "progress": 1.0,
                     "priority": 1,
                     "is_seed": False,
                     "piece_range": [0, 0],
@@ -360,9 +377,9 @@ class SeedrClientWrapper:
             return {
                 "username": settings.account.username,
                 "email": settings.account.email,
-                "space_used": usage.space_used if hasattr(usage, 'space_used') else 0,
-                "space_max": usage.space_max if hasattr(usage, 'space_max') else 0,
-                "bandwidth_used": usage.bandwidth_used if hasattr(usage, 'bandwidth_used') else 0,
+                "space_used": getattr(usage, 'space_used', 0) or 0,
+                "space_max": getattr(usage, 'space_max', 0) or 0,
+                "bandwidth_used": getattr(usage, 'bandwidth_used', 0) or 0,
             }
         except Exception as e:
             logger.error(f"Error getting settings: {e}")
