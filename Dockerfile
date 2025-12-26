@@ -6,7 +6,7 @@
 # =============================================================================
 # Build stage
 # =============================================================================
-FROM --platform=$BUILDPLATFORM python:3.12-slim AS builder
+FROM --platform=$BUILDPLATFORM python:3.14-slim AS builder
 
 # Build arguments
 ARG TARGETPLATFORM
@@ -53,7 +53,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # =============================================================================
 # Runtime stage
 # =============================================================================
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Build arguments for labels
 ARG BUILD_DATE
