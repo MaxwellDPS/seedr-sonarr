@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # Download settings
     download_path: str = "/downloads"
     temp_path: str = "/downloads/temp"
+    
+    # Auto-download from Seedr to local storage
+    auto_download: bool = True  # Automatically download completed torrents
+    delete_after_download: bool = False  # Delete from Seedr after download completes
 
     # Logging
     log_level: str = "INFO"
@@ -65,11 +69,21 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=getattr(logging, settings.log_level))
     logger.info("Starting Seedr-Sonarr proxy...")
 
+    # Create download directory if it doesn't exist
+    try:
+        os.makedirs(settings.download_path, exist_ok=True)
+        os.makedirs(settings.temp_path, exist_ok=True)
+        logger.info(f"Download path: {settings.download_path}")
+    except OSError as e:
+        logger.warning(f"Could not create download directories: {e}")
+
     seedr_client = SeedrClientWrapper(
         email=settings.seedr_email,
         password=settings.seedr_password,
         token=settings.seedr_token,
         download_path=settings.download_path,
+        auto_download=settings.auto_download,
+        delete_after_download=settings.delete_after_download,
     )
 
     try:
@@ -727,7 +741,13 @@ async def torrents_create_category(
     # Store the category
     save_path = savePath if savePath else os.path.join(settings.download_path, category)
     created_categories[category] = save_path
-    logger.info(f"Created category: {category} -> {save_path}")
+    
+    # Actually create the directory
+    try:
+        os.makedirs(save_path, exist_ok=True)
+        logger.info(f"Created category: {category} -> {save_path}")
+    except OSError as e:
+        logger.warning(f"Could not create category directory {save_path}: {e}")
     
     return PlainTextResponse("Ok.")
 
@@ -759,7 +779,13 @@ async def torrents_edit_category(
     
     save_path = savePath if savePath else os.path.join(settings.download_path, category)
     created_categories[category] = save_path
-    logger.info(f"Edited category: {category} -> {save_path}")
+    
+    # Create the directory
+    try:
+        os.makedirs(save_path, exist_ok=True)
+        logger.info(f"Edited category: {category} -> {save_path}")
+    except OSError as e:
+        logger.warning(f"Could not create category directory {save_path}: {e}")
     
     return PlainTextResponse("Ok.")
 
@@ -920,10 +946,19 @@ async def health_check():
     try:
         if seedr_client:
             success, message = await seedr_client.test_connection()
+            
+            # Get download status
+            active_downloads = len(seedr_client._download_tasks)
+            completed_downloads = len(seedr_client._local_downloads)
+            
             return JSONResponse({
                 "status": "healthy" if success else "unhealthy",
                 "seedr_connected": success,
                 "message": message,
+                "auto_download": settings.auto_download,
+                "delete_after_download": settings.delete_after_download,
+                "active_downloads": active_downloads,
+                "completed_downloads": completed_downloads,
             })
     except Exception as e:
         return JSONResponse({
@@ -937,6 +972,122 @@ async def health_check():
         "seedr_connected": False,
         "message": "Client not initialized",
     }, status_code=500)
+
+
+# =============================================================================
+# Download Management Endpoints (Custom - not qBittorrent API)
+# =============================================================================
+
+
+@app.get("/api/seedr/downloads")
+async def get_download_status(request: Request):
+    """Get status of all local downloads from Seedr."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    downloads = []
+    
+    for torrent_hash, torrent in seedr_client._torrents_cache.items():
+        is_downloading = torrent_hash in seedr_client._download_tasks
+        is_completed = torrent_hash in seedr_client._local_downloads
+        progress = seedr_client._download_progress.get(torrent_hash, 0.0)
+        speed = seedr_client._active_downloads.get(torrent_hash, 0)
+        
+        downloads.append({
+            "hash": torrent_hash,
+            "name": torrent.name,
+            "size": torrent.size,
+            "seedr_progress": 1.0 if torrent.state.value == "pausedUP" else torrent.progress,
+            "local_progress": progress,
+            "local_speed": speed,
+            "is_downloading_locally": is_downloading,
+            "is_completed_locally": is_completed,
+            "save_path": torrent.save_path,
+            "content_path": torrent.content_path,
+            "category": torrent.category,
+        })
+    
+    return JSONResponse({
+        "auto_download_enabled": settings.auto_download,
+        "delete_after_download": settings.delete_after_download,
+        "downloads": downloads,
+    })
+
+
+@app.post("/api/seedr/downloads/start")
+async def start_download(request: Request, hashes: str = Form(...)):
+    """Force start downloading specific torrents from Seedr to local storage."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    hash_list = [h.strip().upper() for h in hashes.split("|") if h.strip()]
+    
+    started = []
+    failed = []
+    
+    for torrent_hash in hash_list:
+        success = await seedr_client.force_download(torrent_hash)
+        if success:
+            started.append(torrent_hash)
+        else:
+            failed.append(torrent_hash)
+    
+    return JSONResponse({
+        "started": started,
+        "failed": failed,
+    })
+
+
+@app.post("/api/seedr/downloads/stop")
+async def stop_download(request: Request, hashes: str = Form(...)):
+    """Stop downloading specific torrents."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    hash_list = [h.strip().upper() for h in hashes.split("|") if h.strip()]
+    
+    stopped = []
+    
+    for torrent_hash in hash_list:
+        if torrent_hash in seedr_client._download_tasks:
+            seedr_client._download_tasks[torrent_hash].cancel()
+            stopped.append(torrent_hash)
+    
+    return JSONResponse({
+        "stopped": stopped,
+    })
+
+
+@app.get("/api/seedr/settings")
+async def get_seedr_settings(request: Request):
+    """Get Seedr account settings and usage."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+    
+    try:
+        seedr_settings = await seedr_client.get_settings()
+        return JSONResponse({
+            "seedr": seedr_settings,
+            "proxy": {
+                "auto_download": settings.auto_download,
+                "delete_after_download": settings.delete_after_download,
+                "download_path": settings.download_path,
+            }
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
