@@ -243,14 +243,6 @@ class SeedrClientWrapper:
             return
 
         try:
-            # Restore categories
-            categories = await self._state_manager.get_categories()
-            for name, cat in categories.items():
-                self._category_mapping[name] = cat.save_path
-
-            # Restore hash mappings
-            # Hash mappings are accessed via state_manager.resolve_hash()
-
             # Restore local downloads
             for torrent in await self._state_manager.get_torrents():
                 if torrent.phase == TorrentPhase.COMPLETED:
@@ -1034,9 +1026,9 @@ class SeedrClientWrapper:
                 if torrent_hash.startswith("QUEUE"):
                     queue_id = torrent_hash.replace("QUEUE", "")
                     async with self._queue_lock:
-                        for i, queued in enumerate(list(self._torrent_queue)):
+                        for queued in list(self._torrent_queue):
                             if queued.id == queue_id:
-                                del self._torrent_queue[i]
+                                self._torrent_queue.remove(queued)
                                 self._category_mapping.pop(torrent_hash, None)
                                 self._instance_mapping.pop(torrent_hash, None)
                                 self._torrents_cache.pop(torrent_hash, None)

@@ -523,9 +523,9 @@ class StateManager:
     async def remove_from_queue(self, id: str) -> bool:
         """Remove a specific item from the queue."""
         async with self._lock:
-            for i, queued in enumerate(list(self._queue)):
+            for queued in list(self._queue):
                 if queued.id == id:
-                    del self._queue[i]
+                    self._queue.remove(queued)
                     if self._persist_enabled:
                         await self._persistence.delete_queued(id)
                     return True
