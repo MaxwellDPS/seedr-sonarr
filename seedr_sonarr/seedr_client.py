@@ -628,10 +628,26 @@ class SeedrClientWrapper:
                                 failed_files.append(file.name)
                                 continue
 
+                            # Log file details for debugging
+                            # IMPORTANT: Seedr API expects folder_file_id, NOT file_id!
+                            # seedrcc's fetch_file(file_id) sends it as folder_file_id to the API
+                            file_id = getattr(file, 'file_id', None)
+                            folder_file_id = getattr(file, 'folder_file_id', None)
+                            logger.info(
+                                f"File: {file.name}, file_id={file_id}, folder_file_id={folder_file_id}, "
+                                f"size={file.size}, is_lost={getattr(file, 'is_lost', 'N/A')}"
+                            )
+
+                            # The Seedr API uses folder_file_id - pass this to fetch_file()
+                            if not folder_file_id:
+                                logger.error(f"File {file.name} has no folder_file_id, skipping")
+                                failed_files.append(file.name)
+                                continue
+
                             file_info = await self._retry_handler.with_retry(
-                                operation=lambda fid=file.file_id: self._client.fetch_file(str(fid)),
+                                operation=lambda fid=folder_file_id: self._client.fetch_file(str(fid)),
                                 operation_id=f"fetch_file_{idx}",
-                                max_attempts=3,
+                                max_attempts=1,  # Don't retry 401s - they won't resolve by retrying
                                 should_retry=lambda e: self._is_file_fetch_retryable(e),
                             )
 
