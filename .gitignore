@@ -98,3 +98,4 @@ token.json
 # OS
 .DS_Store
 Thumbs.db
+docker-compose.local.yaml

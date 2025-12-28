@@ -1,6 +1,7 @@
 """
 qBittorrent API Emulation Layer
 Implements the qBittorrent Web API that Sonarr/Radarr expects.
+Supports multiple instances via category-based routing.
 """
 
 import asyncio
@@ -17,6 +18,10 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
 from .seedr_client import SeedrClientWrapper, TorrentState
+from .persistence import PersistenceManager
+from .state import StateManager, TorrentPhase, extract_instance_id, CategoryState
+from .retry import RetryConfig, CircuitBreakerConfig
+from .logging_config import setup_logging, ActivityLogHandler
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +43,31 @@ class Settings(BaseSettings):
     # Download settings
     download_path: str = "/downloads"
     temp_path: str = "/downloads/temp"
-    
-    # Auto-download from Seedr to local storage
-    auto_download: bool = True  # Automatically download completed torrents
-    delete_after_download: bool = True  # Delete from Seedr after download completes (frees storage for queue)
 
-    # Logging
+    # Auto-download from Seedr to local storage
+    auto_download: bool = True
+    delete_after_download: bool = True
+
+    # Persistence settings
+    state_file: str = "seedr_state.db"
+    persist_state: bool = True
+
+    # Retry settings
+    retry_max_attempts: int = 3
+    retry_initial_delay: float = 1.0
+    retry_max_delay: float = 60.0
+
+    # Circuit breaker settings
+    circuit_failure_threshold: int = 5
+    circuit_reset_timeout: float = 60.0
+
+    # Logging settings
     log_level: str = "INFO"
+    log_file: Optional[str] = None
+    log_format: str = "text"  # "text" or "json"
+    log_max_size_mb: int = 10
+    log_backup_count: int = 5
+    activity_log_size: int = 1000
 
     class Config:
         env_file = ".env"
@@ -54,22 +77,32 @@ class Settings(BaseSettings):
 # Global instances
 settings = Settings()
 seedr_client: Optional[SeedrClientWrapper] = None
+state_manager: Optional[StateManager] = None
+persistence_manager: Optional[PersistenceManager] = None
+activity_log_handler: Optional[ActivityLogHandler] = None
 sessions: dict[str, datetime] = {}
 SESSION_TIMEOUT = timedelta(hours=24)
-# Store created categories: name -> savePath
-created_categories: dict[str, str] = {}
+created_categories: dict[str, dict] = {}  # name -> {savePath, instance_id}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global seedr_client
+    global seedr_client, state_manager, persistence_manager, activity_log_handler
 
-    # Startup
-    logging.basicConfig(level=getattr(logging, settings.log_level))
-    logger.info("Starting Seedr-Sonarr proxy...")
+    # Setup logging first
+    activity_log_handler = setup_logging(
+        log_level=settings.log_level,
+        log_file=settings.log_file,
+        log_format=settings.log_format,
+        max_file_size_mb=settings.log_max_size_mb,
+        backup_count=settings.log_backup_count,
+        activity_log_size=settings.activity_log_size,
+    )
 
-    # Create download directory if it doesn't exist
+    logger.info("Starting Seedr-Sonarr proxy with full lifecycle management...")
+
+    # Create download directory
     try:
         os.makedirs(settings.download_path, exist_ok=True)
         os.makedirs(settings.temp_path, exist_ok=True)
@@ -77,6 +110,41 @@ async def lifespan(app: FastAPI):
     except OSError as e:
         logger.warning(f"Could not create download directories: {e}")
 
+    # Initialize persistence
+    if settings.persist_state:
+        persistence_manager = PersistenceManager(settings.state_file)
+        await persistence_manager.initialize()
+        logger.info(f"Persistence enabled: {settings.state_file}")
+
+    # Initialize state manager
+    state_manager = StateManager(
+        persistence=persistence_manager,
+        persist_enabled=settings.persist_state,
+    )
+    await state_manager.initialize()
+
+    # Load persisted categories
+    categories = await state_manager.get_categories()
+    for name, cat in categories.items():
+        created_categories[name] = {
+            "savePath": cat.save_path,
+            "instance_id": cat.instance_id,
+        }
+    logger.info(f"Loaded {len(created_categories)} categories from persistence")
+
+    # Create retry and circuit breaker configs
+    retry_config = RetryConfig(
+        max_attempts=settings.retry_max_attempts,
+        initial_delay=settings.retry_initial_delay,
+        max_delay=settings.retry_max_delay,
+    )
+
+    circuit_config = CircuitBreakerConfig(
+        failure_threshold=settings.circuit_failure_threshold,
+        reset_timeout=settings.circuit_reset_timeout,
+    )
+
+    # Initialize Seedr client
     seedr_client = SeedrClientWrapper(
         email=settings.seedr_email,
         password=settings.seedr_password,
@@ -84,6 +152,9 @@ async def lifespan(app: FastAPI):
         download_path=settings.download_path,
         auto_download=settings.auto_download,
         delete_after_download=settings.delete_after_download,
+        state_manager=state_manager,
+        retry_config=retry_config,
+        circuit_config=circuit_config,
     )
 
     try:
@@ -97,13 +168,15 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if seedr_client:
         await seedr_client.close()
+    if state_manager:
+        await state_manager.close()
     logger.info("Seedr-Sonarr proxy stopped")
 
 
 app = FastAPI(
     title="Seedr-Sonarr Proxy",
-    description="qBittorrent API emulation for Seedr.cc",
-    version="1.0.0",
+    description="qBittorrent API emulation for Seedr.cc with full lifecycle management",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -126,7 +199,6 @@ def validate_session(request: Request) -> bool:
         del sessions[sid]
         return False
 
-    # Extend session
     sessions[sid] = datetime.now() + SESSION_TIMEOUT
     return True
 
@@ -143,6 +215,24 @@ def state_to_qbittorrent(state: TorrentState) -> str:
     return state.value
 
 
+def phase_to_description(phase: TorrentPhase) -> str:
+    """Get human-readable description of a phase."""
+    descriptions = {
+        TorrentPhase.QUEUED_STORAGE: "Waiting for Seedr storage",
+        TorrentPhase.FETCHING_METADATA: "Fetching metadata",
+        TorrentPhase.DOWNLOADING_TO_SEEDR: "Downloading to Seedr",
+        TorrentPhase.SEEDR_PROCESSING: "Seedr processing",
+        TorrentPhase.SEEDR_COMPLETE: "Ready in Seedr",
+        TorrentPhase.QUEUED_LOCAL: "Waiting for local download",
+        TorrentPhase.DOWNLOADING_TO_LOCAL: "Downloading to local",
+        TorrentPhase.COMPLETED: "Completed",
+        TorrentPhase.ERROR: "Error",
+        TorrentPhase.PAUSED: "Paused",
+        TorrentPhase.DELETED: "Deleted",
+    }
+    return descriptions.get(phase, "Unknown")
+
+
 # =============================================================================
 # Authentication Endpoints
 # =============================================================================
@@ -156,11 +246,7 @@ async def auth_login(
     username: Optional[str] = Form(None),
     password: Optional[str] = Form(None),
 ):
-    """
-    Authenticate and create a session.
-    qBittorrent API: POST /api/v2/auth/login
-    """
-    # Handle both form data and query params
+    """Authenticate and create a session."""
     if not username:
         username = request.query_params.get("username", "")
     if not password:
@@ -180,10 +266,7 @@ async def auth_login(
 @app.get("/api/v2/auth/logout")
 @app.post("/api/v2/auth/logout")
 async def auth_logout(request: Request):
-    """
-    Logout and invalidate session.
-    qBittorrent API: POST /api/v2/auth/logout
-    """
+    """Logout and invalidate session."""
     sid = request.cookies.get("SID")
     if sid and sid in sessions:
         del sessions[sid]
@@ -269,12 +352,12 @@ async def transfer_info(request: Request):
     """Return global transfer info."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     try:
         torrents = await seedr_client.get_torrents()
         dl_speed = sum(t.download_speed for t in torrents)
         up_speed = sum(t.upload_speed for t in torrents)
-        
+
         return JSONResponse({
             "dl_info_speed": dl_speed,
             "dl_info_data": sum(t.downloaded for t in torrents),
@@ -307,10 +390,7 @@ async def torrents_info(
     offset: int = 0,
     hashes: Optional[str] = None,
 ):
-    """
-    Get info about torrents.
-    This is the main endpoint Sonarr uses to monitor downloads.
-    """
+    """Get info about torrents with multi-instance support."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -318,13 +398,11 @@ async def torrents_info(
         torrents = await seedr_client.get_torrents()
         result = []
 
-        # Parse hashes filter
         hash_filter = set()
         if hashes:
             hash_filter = set(h.upper() for h in hashes.split("|"))
 
         for torrent in torrents:
-            # Apply filters
             if hash_filter and torrent.hash not in hash_filter:
                 continue
 
@@ -352,7 +430,6 @@ async def torrents_info(
                 ]:
                     continue
 
-            # Format for qBittorrent API
             result.append({
                 "hash": torrent.hash,
                 "name": torrent.name,
@@ -403,12 +480,10 @@ async def torrents_info(
                 "infohash_v2": "",
             })
 
-        # Apply sorting
         if sort:
             reverse_sort = reverse
             result.sort(key=lambda x: x.get(sort, 0), reverse=reverse_sort)
 
-        # Apply pagination
         if limit:
             result = result[offset : offset + limit]
 
@@ -514,24 +589,21 @@ async def torrents_add(
     firstLastPiecePrio: Optional[str] = Form(None),
     addToTopOfQueue: Optional[str] = Form(None),
 ):
-    """
-    Add new torrent(s).
-    This is the endpoint Sonarr uses to send downloads.
-    """
+    """Add new torrent(s) with instance tracking."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
         added_hashes = []
+        instance_id = extract_instance_id(category or "")
 
-        # Handle magnet links / URLs
         if urls:
             for url in urls.split("\n"):
                 url = url.strip()
                 if not url:
                     continue
-                
-                logger.info(f"Adding torrent: {url[:50]}...")
+
+                logger.info(f"Adding torrent from {instance_id}: {url[:50]}...")
                 torrent_hash = await seedr_client.add_torrent(
                     magnet_link=url,
                     category=category or "",
@@ -539,11 +611,10 @@ async def torrents_add(
                 if torrent_hash:
                     added_hashes.append(torrent_hash)
 
-        # Handle torrent file upload
         if torrents:
             content = await torrents.read()
             if content:
-                logger.info(f"Adding torrent file: {torrents.filename}")
+                logger.info(f"Adding torrent file from {instance_id}: {torrents.filename}")
                 torrent_hash = await seedr_client.add_torrent(
                     torrent_file=content,
                     category=category or "",
@@ -552,7 +623,7 @@ async def torrents_add(
                     added_hashes.append(torrent_hash)
 
         if added_hashes:
-            logger.info(f"Successfully added {len(added_hashes)} torrent(s)")
+            logger.info(f"Successfully added {len(added_hashes)} torrent(s) for {instance_id}")
             return PlainTextResponse("Ok.")
         else:
             raise HTTPException(status_code=400, detail="No torrents added")
@@ -580,7 +651,6 @@ async def torrents_delete(
 
         for torrent_hash in hash_list:
             if torrent_hash.lower() == "all":
-                # Delete all torrents
                 torrents = await seedr_client.get_torrents()
                 for t in torrents:
                     await seedr_client.delete_torrent(t.hash, delete_files)
@@ -599,7 +669,6 @@ async def torrents_pause(request: Request, hashes: str = Form(...)):
     """Pause torrent(s) - No-op for Seedr."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    # Seedr doesn't support pausing
     logger.debug(f"Pause requested for: {hashes} (no-op)")
     return PlainTextResponse("Ok.")
 
@@ -609,7 +678,6 @@ async def torrents_resume(request: Request, hashes: str = Form(...)):
     """Resume torrent(s) - No-op for Seedr."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    # Seedr doesn't support pausing/resuming
     logger.debug(f"Resume requested for: {hashes} (no-op)")
     return PlainTextResponse("Ok.")
 
@@ -621,12 +689,15 @@ async def torrents_set_category(
     """Set category for torrent(s)."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
+    instance_id = extract_instance_id(category)
+
     for h in hashes.split("|"):
         h = h.strip().upper()
         if h:
             seedr_client._category_mapping[h] = category
-    
+            seedr_client._instance_mapping[h] = instance_id
+
     return PlainTextResponse("Ok.")
 
 
@@ -673,7 +744,6 @@ async def torrents_rename(
     """Rename torrent - Not implemented."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    # Could implement this via Seedr rename API
     return PlainTextResponse("Ok.")
 
 
@@ -705,20 +775,18 @@ async def torrents_priority(request: Request, hashes: str = Form(...)):
 
 @app.get("/api/v2/torrents/categories")
 async def torrents_categories(request: Request):
-    """Get all categories."""
+    """Get all categories with instance tracking."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     result = {}
-    
-    # Add explicitly created categories
-    for cat_name, save_path in created_categories.items():
+
+    for cat_name, cat_info in created_categories.items():
         result[cat_name] = {
             "name": cat_name,
-            "savePath": save_path,
+            "savePath": cat_info.get("savePath", os.path.join(settings.download_path, cat_name)),
         }
-    
-    # Also add categories from torrents
+
     if seedr_client:
         for cat in set(seedr_client._category_mapping.values()):
             if cat and cat not in result:
@@ -726,7 +794,7 @@ async def torrents_categories(request: Request):
                     "name": cat,
                     "savePath": os.path.join(settings.download_path, cat),
                 }
-    
+
     return JSONResponse(result)
 
 
@@ -734,21 +802,32 @@ async def torrents_categories(request: Request):
 async def torrents_create_category(
     request: Request, category: str = Form(...), savePath: str = Form("")
 ):
-    """Create a category."""
+    """Create a category with instance tracking."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
-    # Store the category
+
+    instance_id = extract_instance_id(category)
     save_path = savePath if savePath else os.path.join(settings.download_path, category)
-    created_categories[category] = save_path
-    
-    # Actually create the directory
+
+    created_categories[category] = {
+        "savePath": save_path,
+        "instance_id": instance_id,
+    }
+
+    # Persist category
+    if state_manager:
+        await state_manager.add_category(CategoryState(
+            name=category,
+            save_path=save_path,
+            instance_id=instance_id,
+        ))
+
     try:
         os.makedirs(save_path, exist_ok=True)
-        logger.info(f"Created category: {category} -> {save_path}")
+        logger.info(f"Created category: {category} -> {save_path} (instance: {instance_id})")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
-    
+
     return PlainTextResponse("Ok.")
 
 
@@ -759,13 +838,15 @@ async def torrents_remove_categories(
     """Remove categories."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     for cat in categories.split("\n"):
         cat = cat.strip()
         if cat and cat in created_categories:
             del created_categories[cat]
+            if state_manager:
+                await state_manager.delete_category(cat)
             logger.info(f"Removed category: {cat}")
-    
+
     return PlainTextResponse("Ok.")
 
 
@@ -776,17 +857,28 @@ async def torrents_edit_category(
     """Edit a category."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
+    instance_id = extract_instance_id(category)
     save_path = savePath if savePath else os.path.join(settings.download_path, category)
-    created_categories[category] = save_path
-    
-    # Create the directory
+
+    created_categories[category] = {
+        "savePath": save_path,
+        "instance_id": instance_id,
+    }
+
+    if state_manager:
+        await state_manager.add_category(CategoryState(
+            name=category,
+            save_path=save_path,
+            instance_id=instance_id,
+        ))
+
     try:
         os.makedirs(save_path, exist_ok=True)
         logger.info(f"Edited category: {category} -> {save_path}")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
-    
+
     return PlainTextResponse("Ok.")
 
 
@@ -840,22 +932,19 @@ async def torrents_delete_tags(request: Request, tags: str = Form(...)):
 
 
 # =============================================================================
-# Sync Endpoint (Used by Sonarr for efficient updates)
+# Sync Endpoint
 # =============================================================================
 
 
 @app.get("/api/v2/sync/maindata")
 async def sync_maindata(request: Request, rid: int = 0):
-    """
-    Get sync data - this is used by Sonarr for efficient polling.
-    Returns all data on first call, then only changes on subsequent calls.
-    """
+    """Get sync data with enhanced phase and instance info."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
         torrents = await seedr_client.get_torrents()
-        
+
         torrents_dict = {}
         for torrent in torrents:
             torrents_dict[torrent.hash] = {
@@ -886,17 +975,13 @@ async def sync_maindata(request: Request, rid: int = 0):
                 "total_size": torrent.size,
             }
 
-        # Get categories
         categories = {}
-        
-        # Add explicitly created categories
-        for cat_name, save_path in created_categories.items():
+        for cat_name, cat_info in created_categories.items():
             categories[cat_name] = {
                 "name": cat_name,
-                "savePath": save_path,
+                "savePath": cat_info.get("savePath", os.path.join(settings.download_path, cat_name)),
             }
-        
-        # Also add categories from torrents
+
         for cat in set(seedr_client._category_mapping.values()):
             if cat and cat not in categories:
                 categories[cat] = {
@@ -925,7 +1010,7 @@ async def sync_maindata(request: Request, rid: int = 0):
                 "queueing": True,
                 "use_alt_speed_limits": False,
                 "refresh_interval": 1500,
-                "free_space_on_disk": 1000000000000,  # 1TB
+                "free_space_on_disk": 1000000000000,
             },
         })
 
@@ -942,23 +1027,24 @@ async def sync_maindata(request: Request, rid: int = 0):
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint with enhanced status."""
     try:
         if seedr_client:
             success, message = await seedr_client.test_connection()
-            
-            # Get download status
-            active_downloads = len(seedr_client._download_tasks)
-            completed_downloads = len(seedr_client._local_downloads)
-            
+
+            stats = seedr_client.get_stats()
+
             return JSONResponse({
                 "status": "healthy" if success else "unhealthy",
                 "seedr_connected": success,
                 "message": message,
                 "auto_download": settings.auto_download,
                 "delete_after_download": settings.delete_after_download,
-                "active_downloads": active_downloads,
-                "completed_downloads": completed_downloads,
+                "persist_state": settings.persist_state,
+                "active_downloads": stats.get("active_downloads", 0),
+                "completed_downloads": stats.get("local_downloads", 0),
+                "queue_size": stats.get("queue_size", 0),
+                "circuit_breaker": stats.get("circuit_breaker", {}).get("state", "unknown"),
             })
     except Exception as e:
         return JSONResponse({
@@ -975,93 +1061,86 @@ async def health_check():
 
 
 # =============================================================================
-# Download Management Endpoints (Custom - not qBittorrent API)
+# Download Management Endpoints
 # =============================================================================
 
 
 @app.get("/api/seedr/downloads")
 async def get_download_status(request: Request):
-    """Get status of all local downloads from Seedr."""
+    """Get status of all downloads with enhanced phase tracking."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     downloads = []
-    
+
     for torrent_hash, torrent in seedr_client._torrents_cache.items():
-        # Skip mapped duplicates (queue hashes that point to real torrents)
         if torrent_hash.startswith("QUEUE") and torrent_hash in seedr_client._hash_mapping:
             continue
-            
+
         is_downloading = torrent_hash in seedr_client._download_tasks
         is_completed = torrent_hash in seedr_client._local_downloads
         local_progress = seedr_client._download_progress.get(torrent_hash, 0.0)
         speed = seedr_client._active_downloads.get(torrent_hash, 0)
-        
-        # Determine Seedr progress (0-100% of the Seedr phase)
+
         if torrent.is_queued:
             seedr_progress = 0.0
-            phase = "queued"
         elif torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
             seedr_progress = 1.0
-            phase = "seedr_complete"
         else:
-            # Active transfer - progress is already 0-50%, so multiply by 2 to get 0-100%
             seedr_progress = min(torrent.progress * 2, 1.0)
-            phase = "downloading_to_seedr"
-        
-        # Update phase based on local download status
-        if is_completed:
-            phase = "complete"
-        elif is_downloading:
-            phase = "downloading_to_local"
-        
+
         downloads.append({
             "hash": torrent_hash,
             "name": torrent.name,
             "size": torrent.size,
-            "phase": phase,
-            "seedr_progress": seedr_progress,  # 0-100% of internet->Seedr
-            "local_progress": local_progress,   # 0-100% of Seedr->local
-            "combined_progress": torrent.progress,  # 0-100% overall (what Sonarr sees)
+            "phase": torrent.phase.value,
+            "phase_description": phase_to_description(torrent.phase),
+            "instance_id": torrent.instance_id,
+            "seedr_progress": seedr_progress,
+            "local_progress": local_progress,
+            "combined_progress": torrent.progress,
             "local_speed": speed,
             "is_downloading_locally": is_downloading,
             "is_completed_locally": is_completed,
             "save_path": torrent.save_path,
             "content_path": torrent.content_path,
             "category": torrent.category,
+            "error_count": torrent.error_count,
+            "last_error": torrent.last_error,
         })
-    
+
     return JSONResponse({
         "auto_download_enabled": settings.auto_download,
         "delete_after_download": settings.delete_after_download,
+        "persist_state": settings.persist_state,
         "downloads": downloads,
     })
 
 
 @app.post("/api/seedr/downloads/start")
 async def start_download(request: Request, hashes: str = Form(...)):
-    """Force start downloading specific torrents from Seedr to local storage."""
+    """Force start downloading specific torrents."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     hash_list = [h.strip().upper() for h in hashes.split("|") if h.strip()]
-    
+
     started = []
     failed = []
-    
+
     for torrent_hash in hash_list:
         success = await seedr_client.force_download(torrent_hash)
         if success:
             started.append(torrent_hash)
         else:
             failed.append(torrent_hash)
-    
+
     return JSONResponse({
         "started": started,
         "failed": failed,
@@ -1073,19 +1152,19 @@ async def stop_download(request: Request, hashes: str = Form(...)):
     """Stop downloading specific torrents."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     hash_list = [h.strip().upper() for h in hashes.split("|") if h.strip()]
-    
+
     stopped = []
-    
+
     for torrent_hash in hash_list:
         if torrent_hash in seedr_client._download_tasks:
             seedr_client._download_tasks[torrent_hash].cancel()
             stopped.append(torrent_hash)
-    
+
     return JSONResponse({
         "stopped": stopped,
     })
@@ -1096,10 +1175,10 @@ async def get_seedr_settings(request: Request):
     """Get Seedr account settings and usage."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     try:
         seedr_settings = await seedr_client.get_settings()
         return JSONResponse({
@@ -1108,6 +1187,8 @@ async def get_seedr_settings(request: Request):
                 "auto_download": settings.auto_download,
                 "delete_after_download": settings.delete_after_download,
                 "download_path": settings.download_path,
+                "persist_state": settings.persist_state,
+                "state_file": settings.state_file,
             }
         })
     except Exception as e:
@@ -1115,22 +1196,22 @@ async def get_seedr_settings(request: Request):
 
 
 # =============================================================================
-# Queue Management Endpoints (Custom)
+# Queue Management Endpoints
 # =============================================================================
 
 
 @app.get("/api/seedr/queue")
 async def get_queue(request: Request):
-    """Get the queue of torrents waiting for Seedr storage."""
+    """Get the queue of torrents with instance info."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     queue_info = seedr_client.get_queue_info()
     available_storage = seedr_client.get_available_storage()
-    
+
     return JSONResponse({
         "queue_size": len(queue_info),
         "available_storage_mb": available_storage / 1024 / 1024,
@@ -1145,12 +1226,12 @@ async def clear_queue(request: Request):
     """Clear all queued torrents."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     count = await seedr_client.clear_queue()
-    
+
     return JSONResponse({
         "cleared": count,
         "message": f"Cleared {count} torrents from queue",
@@ -1159,17 +1240,17 @@ async def clear_queue(request: Request):
 
 @app.post("/api/seedr/queue/process")
 async def process_queue(request: Request):
-    """Force process the queue (try to add queued torrents to Seedr)."""
+    """Force process the queue."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     initial_size = len(seedr_client._torrent_queue)
     await seedr_client._process_queue()
     final_size = len(seedr_client._torrent_queue)
-    
+
     return JSONResponse({
         "processed": initial_size - final_size,
         "remaining": final_size,
@@ -1182,12 +1263,12 @@ async def get_storage(request: Request):
     """Get Seedr storage information."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    
+
     if not seedr_client:
         raise HTTPException(status_code=500, detail="Client not initialized")
-    
+
     await seedr_client._update_storage_info()
-    
+
     return JSONResponse({
         "used_bytes": seedr_client._storage_used,
         "max_bytes": seedr_client._storage_max,
@@ -1197,6 +1278,67 @@ async def get_storage(request: Request):
         "available_mb": seedr_client.get_available_storage() / 1024 / 1024,
         "used_percent": (seedr_client._storage_used / seedr_client._storage_max * 100) if seedr_client._storage_max > 0 else 0,
         "buffer_mb": seedr_client.storage_buffer_mb,
+    })
+
+
+# =============================================================================
+# Activity Log Endpoint
+# =============================================================================
+
+
+@app.get("/api/seedr/logs")
+async def get_activity_logs(
+    request: Request,
+    limit: int = 100,
+    level: Optional[str] = None,
+    torrent_hash: Optional[str] = None,
+    instance_id: Optional[str] = None,
+):
+    """Get activity logs for debugging and monitoring."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not activity_log_handler:
+        return JSONResponse({"count": 0, "logs": []})
+
+    logs = activity_log_handler.get_logs(
+        limit=limit,
+        level=level,
+        torrent_hash=torrent_hash,
+        instance_id=instance_id,
+    )
+
+    return JSONResponse({
+        "count": len(logs),
+        "logs": logs,
+    })
+
+
+# =============================================================================
+# State/Stats Endpoint
+# =============================================================================
+
+
+@app.get("/api/seedr/state")
+async def get_state(request: Request):
+    """Get current state summary and statistics."""
+    if not validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+
+    client_stats = seedr_client.get_stats()
+
+    state_stats = {}
+    if state_manager:
+        state_stats = await state_manager.get_stats()
+
+    return JSONResponse({
+        "client": client_stats,
+        "state_manager": state_stats,
+        "persistence_enabled": settings.persist_state,
+        "state_file": settings.state_file if settings.persist_state else None,
     })
 
 

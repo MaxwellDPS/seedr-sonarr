@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seedr-sonarr"
-version = "1.0.0"
-description = "qBittorrent API emulation for Seedr.cc - Use Seedr as a download client for Sonarr/Radarr"
+version = "2.0.0"
+description = "qBittorrent API emulation for Seedr.cc - Full lifecycle management for Sonarr/Radarr with multi-instance support"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -45,6 +45,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "aiohttp>=3.9.0",
     "aiofiles>=23.0.0",
+    "aiosqlite>=0.19.0",
     "python-multipart>=0.0.6",
 ]
 
