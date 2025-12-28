@@ -860,15 +860,22 @@ class SeedrClientWrapper:
                 try:
                     async def do_add():
                         if magnet_link:
+                            logger.debug(f"Adding magnet link: {magnet_link[:80]}...")
                             return await self._client.add_torrent(magnet_link=magnet_link)
                         elif torrent_file:
-                            return await self._client.add_torrent(torrent_file=torrent_file)
+                            # Ensure torrent_file is bytes
+                            tf = torrent_file
+                            if isinstance(tf, str):
+                                logger.warning("torrent_file is string, encoding to bytes")
+                                tf = tf.encode('latin-1')
+                            logger.debug(f"Adding torrent file ({len(tf)} bytes)")
+                            return await self._client.add_torrent(torrent_file=tf)
                         else:
                             raise ValueError("Either magnet_link or torrent_file required")
 
                     result = await self._retry_handler.with_retry(
                         operation=do_add,
-                        operation_id=f"add_torrent_{hash(magnet_link or torrent_file)}",
+                        operation_id=f"add_torrent_{hash(magnet_link or str(torrent_file)[:100] if torrent_file else '')}",
                         max_attempts=self._retry_handler.config.seedr_api_max_attempts,
                     )
                     await self._circuit_breaker.record_success()
@@ -876,6 +883,16 @@ class SeedrClientWrapper:
                 except Exception as e:
                     await self._circuit_breaker.record_failure()
                     error_str = str(e).lower()
+
+                    # Handle seedrcc parsing errors - usually means API returned an error response
+                    if 'missing' in error_str and 'positional argument' in error_str:
+                        logger.error(f"Seedr API returned unexpected response (likely error or duplicate): {e}")
+                        # This often means the torrent already exists or was rejected
+                        # Queue it for retry later
+                        return await self._add_to_queue(
+                            magnet_link, torrent_file, category, name, estimated_size, instance_id
+                        )
+
                     if 'space' in error_str or 'storage' in error_str or 'limit' in error_str or 'full' in error_str:
                         logger.warning(f"Seedr storage full, queuing: {name}")
                         return await self._add_to_queue(
@@ -1016,7 +1033,11 @@ class SeedrClientWrapper:
                         if queued.magnet_link:
                             result = await self._client.add_torrent(magnet_link=queued.magnet_link)
                         elif queued.torrent_file:
-                            result = await self._client.add_torrent(torrent_file=queued.torrent_file)
+                            # Ensure torrent_file is bytes
+                            tf = queued.torrent_file
+                            if isinstance(tf, str):
+                                tf = tf.encode('latin-1')
+                            result = await self._client.add_torrent(torrent_file=tf)
                         else:
                             logger.error(f"Queued torrent has no magnet or file: {queued.id}")
                             continue
@@ -1047,17 +1068,20 @@ class SeedrClientWrapper:
 
                     except Exception as e:
                         error_str = str(e).lower()
+                        queued.retry_count += 1
+                        queued.last_error = str(e)
+
                         if 'space' in error_str or 'storage' in error_str or 'limit' in error_str:
-                            queued.retry_count += 1
-                            queued.last_error = str(e)
                             self._torrent_queue.appendleft(queued)
                             logger.warning(f"Still not enough storage, re-queued: {queued.name}")
                             break
+                        elif 'missing' in error_str and 'positional argument' in error_str:
+                            # seedrcc parsing error - API returned unexpected response
+                            logger.warning(f"Seedr API returned unexpected response for {queued.name}, will retry later")
+                            if queued.retry_count < self._retry_handler.config.queue_process_max_attempts:
+                                self._torrent_queue.append(queued)
                         else:
-                            queued.retry_count += 1
-                            queued.last_error = str(e)
                             logger.error(f"Failed to add queued torrent: {e}")
-
                             # Re-queue if under max retries
                             if queued.retry_count < self._retry_handler.config.queue_process_max_attempts:
                                 self._torrent_queue.append(queued)
