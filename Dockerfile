@@ -71,7 +71,7 @@ LABEL org.opencontainers.image.title="Seedr-Sonarr Proxy" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/example/seedr-sonarr" \
       org.opencontainers.image.documentation="https://github.com/example/seedr-sonarr#readme" \
-      maintainer="Claude"
+      maintainer="CHAOS.CORP"
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash --uid 1000 seedr

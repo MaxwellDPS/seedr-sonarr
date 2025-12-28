@@ -613,6 +613,7 @@ class SeedrClientWrapper:
 
                     total_size = sum(f.size for f in folder.files)
                     downloaded_size = 0
+                    failed_files = []
 
                     for file in folder.files:
                         file_dest = os.path.join(dest_dir, file.name)
@@ -651,12 +652,26 @@ class SeedrClientWrapper:
                         except Exception as e:
                             logger.error(f"Error downloading file {file.name}: {e}")
                             self._record_error(torrent_hash, str(e))
+                            failed_files.append(file.name)
                             continue
 
-                    # Download complete
+                    # Check if all files were downloaded successfully
+                    if failed_files:
+                        logger.error(
+                            f"Download incomplete for {folder_name}: "
+                            f"{len(failed_files)} file(s) failed: {failed_files}"
+                        )
+                        # Don't mark as complete or delete from Seedr
+                        return
+
+                    # Download complete - all files succeeded
                     self._download_progress[torrent_hash] = 1.0
                     self._local_downloads.add(torrent_hash)
                     logger.info(f"Download complete: {folder_name}")
+
+                    # Clear errors on successful completion
+                    self._error_counts.pop(torrent_hash, None)
+                    self._last_errors.pop(torrent_hash, None)
 
                     # Persist local download
                     if self._state_manager:
