@@ -35,7 +35,7 @@ PLATFORMS ?= linux/amd64,linux/arm64
 # Build Docker image locally
 build:
 	@echo "Building $(IMAGE_NAME):$(TAG)..."
-	docker build -t $(IMAGE_NAME):$(TAG) -t $(IMAGE_NAME):latest .
+	docker buildx build --load -t $(IMAGE_NAME):$(TAG) -t $(IMAGE_NAME):latest .
 
 # Build multi-platform image
 build-multi:
