@@ -1,7 +1,7 @@
 # Makefile for Seedr-Sonarr Proxy
 # ================================
 
-.PHONY: help build push run test clean lint format dev install
+.PHONY: help build push run test clean lint format dev install docker-login
 
 # Default target
 help:
@@ -9,6 +9,7 @@ help:
 	@echo "========================================"
 	@echo ""
 	@echo "Build targets:"
+	@echo "  make docker-login - Login to GHCR using GitHub CLI"
 	@echo "  make build        - Build Docker image locally"
 	@echo "  make push         - Build and push to GitHub Container Registry"
 	@echo "  make run          - Run the Docker container locally"
@@ -31,6 +32,11 @@ IMAGE_NAME ?= ghcr.io/maxwelldps/seedr-sonarr
 VERSION ?= $(shell grep '^version' pyproject.toml | head -1 | cut -d'"' -f2)
 TAG ?= $(VERSION)
 PLATFORMS ?= linux/amd64,linux/arm64
+
+# Login to GHCR using GitHub CLI
+docker-login:
+	@echo "Logging into GitHub Container Registry..."
+	@gh auth token | docker login ghcr.io -u $$(gh api user -q .login) --password-stdin
 
 # Build Docker image locally
 build:

@@ -181,6 +181,7 @@ class SeedrClientWrapper:
         # Error tracking
         self._error_counts: dict[str, int] = {}  # torrent_hash -> error count
         self._last_errors: dict[str, str] = {}  # torrent_hash -> last error message
+        self._download_retry_after: dict[str, float] = {}  # torrent_hash -> timestamp when retry is allowed
 
         # Queue system for storage management
         self._torrent_queue: deque[QueuedTorrent] = deque()
@@ -575,6 +576,11 @@ class SeedrClientWrapper:
         if torrent_hash in self._download_tasks:
             return
 
+        # Check if we need to wait before retrying (cooldown after failures)
+        retry_after = self._download_retry_after.get(torrent_hash, 0)
+        if retry_after > datetime.now().timestamp():
+            return  # Still in cooldown period
+
         task = asyncio.create_task(
             self._download_folder(torrent_hash, str(folder_id), folder_name, save_path)
         )
@@ -607,7 +613,7 @@ class SeedrClientWrapper:
                     downloaded_size = 0
                     failed_files = []
 
-                    for file in folder.files:
+                    for idx, file in enumerate(folder.files):
                         file_dest = os.path.join(dest_dir, file.name)
 
                         if os.path.exists(file_dest) and os.path.getsize(file_dest) == file.size:
@@ -616,11 +622,24 @@ class SeedrClientWrapper:
                             continue
 
                         try:
+                            # Check if file is marked as lost/unavailable
+                            if hasattr(file, 'is_lost') and file.is_lost:
+                                logger.warning(f"File {file.name} is marked as lost/unavailable, skipping")
+                                failed_files.append(file.name)
+                                continue
+
                             file_info = await self._retry_handler.with_retry(
                                 operation=lambda fid=file.file_id: self._client.fetch_file(str(fid)),
-                                operation_id=f"fetch_file_{file.file_id}",
+                                operation_id=f"fetch_file_{idx}",
                                 max_attempts=3,
+                                should_retry=lambda e: self._is_file_fetch_retryable(e),
                             )
+
+                            if not file_info or not hasattr(file_info, 'url') or not file_info.url:
+                                logger.warning(f"File {file.name} has no download URL, may not be ready")
+                                failed_files.append(file.name)
+                                continue
+
                             download_url = file_info.url
 
                             await self._download_file_with_progress(
@@ -653,6 +672,11 @@ class SeedrClientWrapper:
                             f"Download incomplete for {folder_name}: "
                             f"{len(failed_files)} file(s) failed: {failed_files}"
                         )
+                        # Set cooldown before retry (exponential backoff: 60s, 120s, 240s, max 600s)
+                        error_count = self._error_counts.get(torrent_hash, 1)
+                        cooldown = min(60 * (2 ** (error_count - 1)), 600)
+                        self._download_retry_after[torrent_hash] = datetime.now().timestamp() + cooldown
+                        logger.info(f"Will retry download of {folder_name} in {cooldown}s")
                         # Don't mark as complete or delete from Seedr
                         return
 
@@ -661,9 +685,10 @@ class SeedrClientWrapper:
                     self._local_downloads.add(torrent_hash)
                     logger.info(f"Download complete: {folder_name}")
 
-                    # Clear errors on successful completion
+                    # Clear errors and retry cooldown on successful completion
                     self._error_counts.pop(torrent_hash, None)
                     self._last_errors.pop(torrent_hash, None)
+                    self._download_retry_after.pop(torrent_hash, None)
 
                     # Persist local download
                     if self._state_manager:
@@ -688,6 +713,22 @@ class SeedrClientWrapper:
                 logger.error(f"Error downloading folder {folder_name}: {e}")
                 self._download_progress[torrent_hash] = 0.0
                 self._record_error(torrent_hash, str(e))
+
+    def _is_file_fetch_retryable(self, error: Exception) -> bool:
+        """Check if a file fetch error should be retried.
+
+        401 Unauthorized from fetch_file typically means the file isn't ready yet
+        on Seedr's servers, so we should NOT retry immediately - the file needs
+        time to process. Return False to fail fast and let the next poll retry.
+        """
+        error_str = str(error).lower()
+        # 401/unauthorized means file not ready - don't retry, fail fast
+        if '401' in error_str or 'unauthorized' in error_str or 'invalid json' in error_str:
+            return False
+        # Retry on transient network errors
+        if any(x in error_str for x in ['timeout', 'connection', '503', '502', '504']):
+            return True
+        return False
 
     def _record_error(self, torrent_hash: str, error: str):
         """Record an error for a torrent."""
