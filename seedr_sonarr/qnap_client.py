@@ -178,7 +178,7 @@ class QnapDownloadStationClient:
         url: str,
         temp_folder: str = "Download",
         dest_folder: str = "",
-    ) -> Optional[str]:
+    ) -> tuple[bool, Optional[str]]:
         """
         Add a download task by URL.
 
@@ -188,7 +188,8 @@ class QnapDownloadStationClient:
             dest_folder: Final destination folder after completion (relative to share)
 
         Returns:
-            Task ID if successful, None otherwise
+            Tuple of (success: bool, task_id: Optional[str])
+            Note: QNAP API may not return a task ID even on success
         """
         try:
             params = {
@@ -200,15 +201,16 @@ class QnapDownloadStationClient:
 
             result = await self._request("Task", "AddUrl", params)
 
-            # The API may return task info or just success
+            # The API may return task info or just success (error=0)
+            # If error is 0 or not present, the task was added successfully
             task_id = result.get("id") or result.get("task_id")
 
             logger.info(f"Added QNAP download task: {url[:50]}... -> {dest_folder or temp_folder}")
-            return task_id
+            return True, task_id
 
         except Exception as e:
             logger.error(f"Failed to add QNAP download: {e}")
-            return None
+            return False, None
 
     async def get_task_status(self, task_id: str) -> Optional[QnapTask]:
         """Get status of a specific download task."""

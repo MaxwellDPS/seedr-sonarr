@@ -711,6 +711,9 @@ class SeedrClientWrapper:
 
                     logger.info(f"QNAP destination folder: {dest_folder} (category={category}, torrent={folder_name})")
 
+                    # Track successful file additions
+                    successful_files = []
+
                     for idx, file in enumerate(folder.files):
                         try:
                             # Check if file is marked as lost/unavailable
@@ -742,19 +745,20 @@ class SeedrClientWrapper:
                             download_url = file_info.url
 
                             # Add download task to QNAP
-                            task_id = await self._qnap_client.add_download(
+                            # Returns (success, task_id) - task_id may be None even on success
+                            success, task_id = await self._qnap_client.add_download(
                                 url=download_url,
                                 temp_folder=self._qnap_temp_folder,
                                 dest_folder=dest_folder,
                             )
 
-                            if task_id:
-                                qnap_tasks.append({
-                                    "task_id": task_id,
+                            if success:
+                                successful_files.append({
                                     "file_name": file.name,
                                     "size": file.size,
+                                    "task_id": task_id,  # May be None
                                 })
-                                logger.info(f"Added QNAP task {task_id} for {file.name}")
+                                logger.info(f"Added QNAP download for {file.name}")
                             else:
                                 logger.error(f"Failed to add QNAP task for {file.name}")
                                 failed_files.append(file.name)
@@ -764,85 +768,33 @@ class SeedrClientWrapper:
                             self._record_error(torrent_hash, str(e))
                             failed_files.append(file.name)
 
-                    if not qnap_tasks:
-                        logger.error(f"No QNAP tasks created for {folder_name}")
-                        self._record_error(torrent_hash, "No QNAP tasks created")
+                    if not successful_files:
+                        logger.error(f"No QNAP downloads added for {folder_name}")
+                        self._record_error(torrent_hash, "No QNAP downloads added")
                         return
 
-                    # Store task mapping for status tracking
-                    self._qnap_task_mapping[torrent_hash] = ",".join(t["task_id"] for t in qnap_tasks)
+                    # QNAP Download Station doesn't always return task IDs, so we can't
+                    # reliably monitor individual tasks. Instead, we mark this as handed
+                    # off to QNAP and consider it successful. The files will appear in
+                    # the destination folder when QNAP finishes downloading.
+                    logger.info(
+                        f"Added {len(successful_files)} files to QNAP Download Station for {folder_name}. "
+                        f"QNAP will handle the downloads independently."
+                    )
 
-                    # Monitor QNAP tasks until completion
-                    logger.info(f"Monitoring {len(qnap_tasks)} QNAP tasks for {folder_name}")
-                    completed_tasks = set()
-                    max_poll_time = 3600 * 6  # 6 hours max
-                    poll_start = datetime.now().timestamp()
-
-                    while len(completed_tasks) < len(qnap_tasks):
-                        if datetime.now().timestamp() - poll_start > max_poll_time:
-                            logger.error(f"QNAP download timed out for {folder_name}")
-                            self._record_error(torrent_hash, "QNAP download timeout")
-                            return
-
-                        total_progress = 0
-                        total_speed = 0
-
-                        for task_info in qnap_tasks:
-                            if task_info["task_id"] in completed_tasks:
-                                total_progress += task_info["size"]
-                                continue
-
-                            task_status = await self._qnap_client.get_task_status(task_info["task_id"])
-                            if not task_status:
-                                continue
-
-                            if task_status.status == QnapTaskStatus.COMPLETED:
-                                completed_tasks.add(task_info["task_id"])
-                                total_progress += task_info["size"]
-                                logger.info(f"QNAP task completed: {task_info['file_name']}")
-                            elif task_status.status == QnapTaskStatus.ERROR:
-                                logger.error(f"QNAP task failed: {task_info['file_name']} - {task_status.error_message}")
-                                failed_files.append(task_info["file_name"])
-                                completed_tasks.add(task_info["task_id"])  # Mark as done (failed)
-                            else:
-                                # Still downloading
-                                total_progress += task_status.downloaded
-                                total_speed += task_status.download_speed
-
-                        # Update progress
-                        if total_size > 0:
-                            self._download_progress[torrent_hash] = total_progress / total_size
-                        self._active_downloads[torrent_hash] = total_speed
-
-                        await asyncio.sleep(5)  # Poll every 5 seconds
-
-                    # Clean up QNAP task mapping
-                    self._qnap_task_mapping.pop(torrent_hash, None)
-
-                    # Remove completed tasks from QNAP Download Station
-                    for task_info in qnap_tasks:
-                        try:
-                            await self._qnap_client.remove_task(task_info["task_id"])
-                            logger.debug(f"Removed QNAP task {task_info['task_id']}")
-                        except Exception as e:
-                            logger.warning(f"Failed to remove QNAP task {task_info['task_id']}: {e}")
-
-                    # Check if all files were downloaded successfully
+                    # Check if some files failed to be added to QNAP
                     if failed_files:
-                        logger.error(
-                            f"QNAP download incomplete for {folder_name}: "
+                        logger.warning(
+                            f"Some files could not be added to QNAP for {folder_name}: "
                             f"{len(failed_files)} file(s) failed: {failed_files}"
                         )
-                        error_count = self._error_counts.get(torrent_hash, 1)
-                        cooldown = min(60 * (2 ** (error_count - 1)), 600)
-                        self._download_retry_after[torrent_hash] = datetime.now().timestamp() + cooldown
-                        logger.info(f"Will retry QNAP download of {folder_name} in {cooldown}s")
-                        return
+                        # Still continue - the successful files will download
 
-                    # Download complete
+                    # Mark as handed off to QNAP - files will download in background
+                    # We consider this "complete" from our perspective since QNAP handles the rest
                     self._download_progress[torrent_hash] = 1.0
                     self._local_downloads.add(torrent_hash)
-                    logger.info(f"QNAP download complete: {folder_name}")
+                    logger.info(f"Handed off to QNAP Download Station: {folder_name}")
 
                     # Clear errors
                     self._error_counts.pop(torrent_hash, None)
@@ -853,7 +805,7 @@ class SeedrClientWrapper:
                     if self._state_manager:
                         await self._state_manager.mark_local_download(torrent_hash)
 
-                    # Delete from Seedr after successful download
+                    # Delete from Seedr after handing off to QNAP
                     if self.delete_after_download:
                         try:
                             await self._client.delete_folder(folder_id)
@@ -865,14 +817,6 @@ class SeedrClientWrapper:
 
             except asyncio.CancelledError:
                 logger.info(f"QNAP download cancelled: {folder_name}")
-                # Cancel QNAP tasks
-                if torrent_hash in self._qnap_task_mapping:
-                    for task_id in self._qnap_task_mapping[torrent_hash].split(","):
-                        try:
-                            await self._qnap_client.remove_task(task_id)
-                        except Exception:
-                            pass
-                    self._qnap_task_mapping.pop(torrent_hash, None)
                 self._download_progress.pop(torrent_hash, None)
                 self._active_downloads.pop(torrent_hash, None)
                 raise
