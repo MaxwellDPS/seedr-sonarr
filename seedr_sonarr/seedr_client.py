@@ -666,9 +666,11 @@ class SeedrClientWrapper:
             await self._download_folder_direct(torrent_hash, folder_id, folder_name, save_path)
 
     async def _download_folder_via_qnap(self, torrent_hash: str, folder_id: str, folder_name: str, save_path: str):
-        """Download files from Seedr using QNAP Download Station."""
-        from .qnap_client import QnapTaskStatus
+        """Download files from Seedr using QNAP Download Station.
 
+        This method adds download URLs to QNAP Download Station and then considers the
+        handoff complete. QNAP handles the actual downloading independently.
+        """
         async with self._download_lock:
             try:
                 with LogContext(torrent_hash=torrent_hash, torrent_name=folder_name):
@@ -683,9 +685,7 @@ class SeedrClientWrapper:
                     )
 
                     total_size = sum(f.size for f in folder.files)
-                    total_downloaded = 0
                     failed_files = []
-                    qnap_tasks = []  # Track QNAP task IDs for this torrent
 
                     # Determine QNAP destination folder
                     # Structure: {qnap_dest_folder}/{category}/{folder_name}/
