@@ -688,18 +688,28 @@ class SeedrClientWrapper:
                     qnap_tasks = []  # Track QNAP task IDs for this torrent
 
                     # Determine QNAP destination folder
-                    # Structure: {qnap_dest_folder}/{category}/{torrent_name}/
-                    # Example: plex/downloads/sonarr/Show.S01E01/
-                    # This maps to /downloads/sonarr/Show.S01E01/ in containers
+                    # Structure: {qnap_dest_folder}/{category}/{folder_name}/
+                    # Example: plex/downloads/sonarr/Show.Name.S01E01/
+                    #
+                    # IMPORTANT: We must create the folder on the local filesystem first,
+                    # as QNAP Download Station requires the destination folder to exist.
+                    # The local /downloads path maps to plex/downloads on QNAP via the bind mount.
                     category = self._category_mapping.get(torrent_hash, "")
-                    if category and self._qnap_dest_folder:
-                        dest_folder = f"{self._qnap_dest_folder}/{category}/{folder_name}"
-                    elif self._qnap_dest_folder:
-                        dest_folder = f"{self._qnap_dest_folder}/{folder_name}"
-                    else:
-                        dest_folder = folder_name
 
-                    logger.info(f"QNAP destination folder: {dest_folder} (category={category})")
+                    # Build local path and create directory
+                    if category:
+                        local_dest = os.path.join(self.download_path, category, folder_name)
+                        dest_folder = f"{self._qnap_dest_folder}/{category}/{folder_name}" if self._qnap_dest_folder else ""
+                    else:
+                        local_dest = os.path.join(self.download_path, folder_name)
+                        dest_folder = f"{self._qnap_dest_folder}/{folder_name}" if self._qnap_dest_folder else ""
+
+                    # Create the destination folder on the local filesystem
+                    # This is required because QNAP needs the folder to exist before downloading
+                    os.makedirs(local_dest, exist_ok=True)
+                    logger.info(f"Created local destination folder: {local_dest}")
+
+                    logger.info(f"QNAP destination folder: {dest_folder} (category={category}, torrent={folder_name})")
 
                     for idx, file in enumerate(folder.files):
                         try:
