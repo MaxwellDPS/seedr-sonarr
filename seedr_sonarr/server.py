@@ -99,7 +99,9 @@ qnap_client = None  # Optional QNAP Download Station client
 sessions: dict[str, datetime] = {}
 SESSION_TIMEOUT = timedelta(hours=24)
 SESSION_CLEANUP_INTERVAL = 300  # Clean up expired sessions every 5 minutes
+QUEUE_PROCESS_INTERVAL = 60  # Process queue every 60 seconds
 _session_cleanup_task: Optional[asyncio.Task] = None
+_queue_process_task: Optional[asyncio.Task] = None
 created_categories: dict[str, dict] = {}  # name -> {savePath, instance_id}
 
 
@@ -267,6 +269,12 @@ async def lifespan(app: FastAPI):
     try:
         await seedr_client.initialize()
         logger.info("Seedr client connected successfully")
+
+        # Process any queued torrents on startup
+        if seedr_client._torrent_queue:
+            logger.info(f"Processing {len(seedr_client._torrent_queue)} queued torrents on startup...")
+            await seedr_client._process_queue()
+            logger.info(f"Queue processing complete. {len(seedr_client._torrent_queue)} torrents remaining in queue")
     except Exception as e:
         logger.error(f"Failed to initialize Seedr client: {e}")
 
