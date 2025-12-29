@@ -1595,10 +1595,16 @@ class SeedrClientWrapper:
                             self._torrent_queue.appendleft(queued)
                             logger.warning(f"Still not enough storage, re-queued: {queued.name}")
                             break
+                        elif 'duplicate' in error_str or 'already' in error_str or 'exists' in error_str:
+                            # Torrent already exists in Seedr - this is fine, just skip
+                            logger.info(f"Torrent already in Seedr (duplicate): {queued.name}")
+                            # Don't re-queue, treat as success
                         elif 'missing' in error_str and 'positional argument' in error_str:
                             # seedrcc parsing error - API returned unexpected response
-                            logger.warning(f"Seedr API returned unexpected response for {queued.name}, will retry later")
-                            if queued.retry_count < self._retry_handler.config.queue_process_max_attempts:
+                            # This often means the torrent was actually added but response parsing failed
+                            logger.warning(f"Seedr API returned unexpected response for {queued.name} (may have been added anyway)")
+                            # Only retry a few times since it might actually be in Seedr
+                            if queued.retry_count < 2:
                                 self._torrent_queue.append(queued)
                         else:
                             logger.error(f"Failed to add queued torrent: {e}")
