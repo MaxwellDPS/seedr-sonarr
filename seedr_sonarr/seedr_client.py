@@ -20,7 +20,7 @@ import aiofiles
 import aiohttp
 
 from .logging_config import LogContext
-from .retry import RetryHandler, CircuitBreaker, RetryConfig, CircuitBreakerConfig
+from .retry import RetryHandler, CircuitBreaker, RetryConfig, CircuitBreakerConfig, RateLimiter
 from .state import TorrentPhase, extract_instance_id
 
 if TYPE_CHECKING:
@@ -158,16 +158,18 @@ class SeedrClientWrapper:
         self._lock = asyncio.Lock()
         self._download_lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
+        self._mapping_lock = asyncio.Lock()  # Lock for category/instance mappings
 
         # State manager for persistence
         self._state_manager = state_manager
 
-        # Retry and circuit breaker
+        # Retry, circuit breaker, and rate limiter
         self._retry_handler = RetryHandler(retry_config or RetryConfig())
         self._circuit_breaker = CircuitBreaker(
             circuit_config or CircuitBreakerConfig(),
             name="seedr_api"
         )
+        self._rate_limiter = RateLimiter(rate=5.0, burst=10)  # 5 req/s, burst of 10
 
         # Caches and state
         self._torrents_cache: dict[str, SeedrTorrent] = {}
@@ -195,6 +197,10 @@ class SeedrClientWrapper:
         self._storage_used: int = 0
         self._storage_max: int = 0
         self._last_storage_check: float = 0
+
+        # Cache staleness tracking
+        self._last_successful_api_call: float = 0
+        self._cache_max_age: float = 300.0  # 5 minutes max cache age
 
     async def initialize(self):
         """Initialize the Seedr client."""
@@ -364,7 +370,14 @@ class SeedrClientWrapper:
 
         # Check circuit breaker
         if not await self._circuit_breaker.can_execute():
-            logger.warning("Circuit breaker open, returning cached torrents")
+            cache_age = datetime.now().timestamp() - self._last_successful_api_call
+            if cache_age > self._cache_max_age:
+                logger.warning(
+                    f"Circuit breaker open and cache stale ({cache_age:.0f}s old). "
+                    "Data may be outdated."
+                )
+            else:
+                logger.warning("Circuit breaker open, returning cached torrents")
             return list(self._torrents_cache.values())
 
         async with self._lock:
@@ -375,13 +388,15 @@ class SeedrClientWrapper:
                 if datetime.now().timestamp() - self._last_storage_check > 60:
                     await self._update_storage_info()
 
-                # Get root folder contents with retry
+                # Get root folder contents with retry and rate limiting
+                await self._rate_limiter.acquire()
                 contents = await self._retry_handler.with_retry(
                     operation=lambda: self._client.list_contents(),
                     operation_id="list_contents",
                     max_attempts=3,
                 )
                 await self._circuit_breaker.record_success()
+                self._last_successful_api_call = datetime.now().timestamp()
 
                 # Process active torrents (downloading in Seedr from internet)
                 for transfer in contents.torrents:
@@ -607,7 +622,8 @@ class SeedrClientWrapper:
                     dest_dir = os.path.join(save_path, folder_name)
                     os.makedirs(dest_dir, exist_ok=True)
 
-                    # Get folder contents with retry
+                    # Get folder contents with retry and rate limiting
+                    await self._rate_limiter.acquire()
                     folder = await self._retry_handler.with_retry(
                         operation=lambda: self._client.list_contents(folder_id),
                         operation_id=f"list_folder_{folder_id}",
@@ -649,6 +665,7 @@ class SeedrClientWrapper:
                                 failed_files.append(file.name)
                                 continue
 
+                            await self._rate_limiter.acquire()
                             file_info = await self._retry_handler.with_retry(
                                 operation=lambda fid=folder_file_id: self._client.fetch_file(str(fid)),
                                 operation_id=f"fetch_file_{idx}",
@@ -729,6 +746,20 @@ class SeedrClientWrapper:
 
             except asyncio.CancelledError:
                 logger.info(f"Download cancelled: {folder_name}")
+                # Clean up partial downloads
+                dest_dir = os.path.join(save_path, folder_name)
+                if os.path.exists(dest_dir):
+                    try:
+                        # Check if download was incomplete
+                        if torrent_hash not in self._local_downloads:
+                            import shutil
+                            shutil.rmtree(dest_dir)
+                            logger.info(f"Cleaned up partial download: {dest_dir}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up partial download: {cleanup_error}")
+                # Clear progress tracking
+                self._download_progress.pop(torrent_hash, None)
+                self._active_downloads.pop(torrent_hash, None)
                 raise
             except Exception as e:
                 logger.error(f"Error downloading folder {folder_name}: {e}")
@@ -800,7 +831,17 @@ class SeedrClientWrapper:
                                 last_downloaded = downloaded
 
                     if expected_size > 0 and downloaded != expected_size:
-                        logger.warning(f"Size mismatch: expected {expected_size}, got {downloaded}")
+                        logger.warning(
+                            f"Size mismatch: expected {expected_size}, got {downloaded}"
+                        )
+                        # Delete incomplete file and raise error to trigger retry
+                        try:
+                            os.remove(destination)
+                        except OSError:
+                            pass
+                        raise Exception(
+                            f"Size mismatch: expected {expected_size} bytes, got {downloaded}"
+                        )
 
         await self._retry_handler.with_retry(
             operation=do_download,
@@ -951,6 +992,25 @@ class SeedrClientWrapper:
             pass
         return "Unknown Torrent"
 
+    async def set_category_mapping(self, torrent_hash: str, category: str, instance_id: str = ""):
+        """Thread-safe method to set category and instance mapping for a torrent."""
+        async with self._mapping_lock:
+            self._category_mapping[torrent_hash] = category
+            self._instance_mapping[torrent_hash] = instance_id or extract_instance_id(category)
+
+    async def get_category_mapping(self, torrent_hash: str) -> tuple[str, str]:
+        """Thread-safe method to get category and instance mapping for a torrent."""
+        async with self._mapping_lock:
+            category = self._category_mapping.get(torrent_hash, "")
+            instance_id = self._instance_mapping.get(torrent_hash, "")
+            return category, instance_id
+
+    async def remove_mapping(self, torrent_hash: str):
+        """Thread-safe method to remove category and instance mapping for a torrent."""
+        async with self._mapping_lock:
+            self._category_mapping.pop(torrent_hash, None)
+            self._instance_mapping.pop(torrent_hash, None)
+
     async def _add_to_queue(
         self,
         magnet_link: Optional[str],
@@ -1054,16 +1114,23 @@ class SeedrClientWrapper:
                             real_hash = f"SEEDR{result.id}"
 
                         if real_hash:
-                            self._hash_mapping[queue_hash] = real_hash
+                            # Atomic update of hash mapping and category mappings
+                            async with self._mapping_lock:
+                                self._hash_mapping[queue_hash] = real_hash
+                                if queued.category:
+                                    self._category_mapping[real_hash] = queued.category
+                                    self._instance_mapping[real_hash] = queued.instance_id
+
                             logger.info(f"Hash mapping: {queue_hash} -> {real_hash}")
 
                             # Persist hash mapping
                             if self._state_manager:
-                                await self._state_manager.add_hash_mapping(queue_hash, real_hash)
+                                try:
+                                    await self._state_manager.add_hash_mapping(queue_hash, real_hash)
+                                except Exception as persist_err:
+                                    logger.warning(f"Failed to persist hash mapping: {persist_err}")
 
                         if queued.category:
-                            self._category_mapping[real_hash] = queued.category
-                            self._instance_mapping[real_hash] = queued.instance_id
                             cat_path = os.path.join(self.download_path, queued.category)
                             os.makedirs(cat_path, exist_ok=True)
 
@@ -1395,6 +1462,7 @@ class SeedrClientWrapper:
         cooldowns = {
             h: int(t - now) for h, t in self._download_retry_after.items() if t > now
         }
+        cache_age = now - self._last_successful_api_call if self._last_successful_api_call else None
         return {
             "torrents_cached": len(self._torrents_cache),
             "queue_size": len(self._torrent_queue),
@@ -1405,7 +1473,10 @@ class SeedrClientWrapper:
             "storage_used_mb": self._storage_used / 1024 / 1024,
             "storage_max_mb": self._storage_max / 1024 / 1024,
             "storage_available_mb": self.get_available_storage() / 1024 / 1024,
+            "cache_age_seconds": cache_age,
+            "cache_stale": cache_age > self._cache_max_age if cache_age else False,
             "circuit_breaker": self._circuit_breaker.get_stats(),
+            "rate_limiter": self._rate_limiter.get_stats(),
             "retry": self._retry_handler.get_stats(),
             "errors": {
                 "total_torrents_with_errors": len(self._error_counts),

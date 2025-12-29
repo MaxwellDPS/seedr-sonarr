@@ -82,13 +82,32 @@ persistence_manager: Optional[PersistenceManager] = None
 activity_log_handler: Optional[ActivityLogHandler] = None
 sessions: dict[str, datetime] = {}
 SESSION_TIMEOUT = timedelta(hours=24)
+SESSION_CLEANUP_INTERVAL = 300  # Clean up expired sessions every 5 minutes
+_session_cleanup_task: Optional[asyncio.Task] = None
 created_categories: dict[str, dict] = {}  # name -> {savePath, instance_id}
+
+
+async def _cleanup_expired_sessions():
+    """Periodically clean up expired sessions to prevent memory leaks."""
+    while True:
+        try:
+            await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+            now = datetime.now()
+            expired = [sid for sid, expiry in sessions.items() if now > expiry]
+            for sid in expired:
+                sessions.pop(sid, None)
+            if expired:
+                logger.debug(f"Cleaned up {len(expired)} expired sessions")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Error in session cleanup: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global seedr_client, state_manager, persistence_manager, activity_log_handler
+    global seedr_client, state_manager, persistence_manager, activity_log_handler, _session_cleanup_task
 
     # Setup logging first
     activity_log_handler = setup_logging(
@@ -163,7 +182,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize Seedr client: {e}")
 
+    # Start session cleanup task
+    _session_cleanup_task = asyncio.create_task(_cleanup_expired_sessions())
+
     yield
+
+    # Cancel session cleanup task
+    if _session_cleanup_task:
+        _session_cleanup_task.cancel()
+        try:
+            await _session_cleanup_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown
     if seedr_client:
@@ -213,6 +243,29 @@ def create_session() -> str:
 def state_to_qbittorrent(state: TorrentState) -> str:
     """Convert internal state to qBittorrent state string."""
     return state.value
+
+
+def sanitize_error_message(error: Exception) -> str:
+    """Sanitize error messages to avoid leaking sensitive information."""
+    error_str = str(error)
+    # List of patterns that might contain sensitive info
+    sensitive_patterns = [
+        "token",
+        "password",
+        "secret",
+        "key",
+        "auth",
+        "credential",
+        "bearer",
+    ]
+    error_lower = error_str.lower()
+    for pattern in sensitive_patterns:
+        if pattern in error_lower:
+            return "An internal error occurred. Check server logs for details."
+    # Truncate very long error messages
+    if len(error_str) > 200:
+        return error_str[:200] + "..."
+    return error_str
 
 
 def phase_to_description(phase: TorrentPhase) -> str:
@@ -370,7 +423,7 @@ async def transfer_info(request: Request):
         })
     except Exception as e:
         logger.error(f"Error getting transfer info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 # =============================================================================
@@ -491,7 +544,7 @@ async def torrents_info(
 
     except Exception as e:
         logger.error(f"Error getting torrents: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 @app.get("/api/v2/torrents/properties")
@@ -550,7 +603,7 @@ async def torrents_properties(request: Request, hash: str):
         raise
     except Exception as e:
         logger.error(f"Error getting torrent properties: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 @app.get("/api/v2/torrents/files")
@@ -564,7 +617,7 @@ async def torrents_files(request: Request, hash: str):
         return JSONResponse(files)
     except Exception as e:
         logger.error(f"Error getting torrent files: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 @app.post("/api/v2/torrents/add")
@@ -632,7 +685,7 @@ async def torrents_add(
         raise
     except Exception as e:
         logger.error(f"Error adding torrent: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 @app.post("/api/v2/torrents/delete")
@@ -661,7 +714,7 @@ async def torrents_delete(
 
     except Exception as e:
         logger.error(f"Error deleting torrents: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 @app.post("/api/v2/torrents/pause")
@@ -695,8 +748,7 @@ async def torrents_set_category(
     for h in hashes.split("|"):
         h = h.strip().upper()
         if h:
-            seedr_client._category_mapping[h] = category
-            seedr_client._instance_mapping[h] = instance_id
+            await seedr_client.set_category_mapping(h, category, instance_id)
 
     return PlainTextResponse("Ok.")
 
@@ -1016,7 +1068,7 @@ async def sync_maindata(request: Request, rid: int = 0):
 
     except Exception as e:
         logger.error(f"Error in sync maindata: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 # =============================================================================
@@ -1192,7 +1244,7 @@ async def get_seedr_settings(request: Request):
             }
         })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e)) from e
 
 
 # =============================================================================

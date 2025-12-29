@@ -448,6 +448,76 @@ class CircuitOpenError(Exception):
     pass
 
 
+class RateLimiter:
+    """
+    Token bucket rate limiter for API calls.
+    Prevents overwhelming the Seedr API with too many requests.
+    """
+
+    def __init__(
+        self,
+        rate: float = 10.0,  # requests per second
+        burst: int = 20,     # max burst size
+    ):
+        self.rate = rate
+        self.burst = burst
+        self._tokens = float(burst)
+        self._last_update = datetime.now().timestamp()
+        self._lock = asyncio.Lock()
+        self._total_requests = 0
+        self._throttled_requests = 0
+
+    async def acquire(self, timeout: float = 30.0) -> bool:
+        """
+        Acquire a token, waiting if necessary.
+
+        Args:
+            timeout: Maximum time to wait for a token
+
+        Returns:
+            True if token acquired, False if timeout
+        """
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            async with self._lock:
+                now = datetime.now().timestamp()
+                elapsed = now - self._last_update
+                self._last_update = now
+
+                # Add tokens based on elapsed time
+                self._tokens = min(
+                    float(self.burst),
+                    self._tokens + elapsed * self.rate
+                )
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    self._total_requests += 1
+                    return True
+
+                # Calculate wait time
+                wait_time = (1.0 - self._tokens) / self.rate
+
+            # Check timeout
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                self._throttled_requests += 1
+                return False
+
+            # Wait for tokens to refill
+            await asyncio.sleep(min(wait_time, 0.1))
+
+    def get_stats(self) -> dict:
+        """Get rate limiter statistics."""
+        return {
+            "rate_per_second": self.rate,
+            "burst_size": self.burst,
+            "available_tokens": self._tokens,
+            "total_requests": self._total_requests,
+            "throttled_requests": self._throttled_requests,
+        }
+
+
 class ResilientExecutor:
     """
     Combines retry logic and circuit breaker for resilient operations.
