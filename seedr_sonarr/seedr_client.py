@@ -8,6 +8,7 @@ retry logic, state persistence, and multi-instance support.
 import asyncio
 import logging
 import os
+import tempfile
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass, field
