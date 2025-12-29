@@ -535,19 +535,22 @@ class SeedrClientWrapper:
                     qnap_speed = qnap_info.get("speed", 0)
                     qnap_eta = qnap_info.get("eta", 8640000)
                     qnap_status = qnap_info.get("status", "unknown")
-                    has_qnap_tasks = qnap_status in ("downloading", "waiting", "completed")
+                    # has_qnap_tasks = QNAP is actively handling this folder (downloading or waiting)
+                    has_qnap_tasks = qnap_status in ("downloading", "waiting")
+                    # qnap_completed = QNAP finished downloading this folder
+                    qnap_completed = qnap_status == "completed"
 
                     if is_local:
                         state = TorrentState.COMPLETED_LOCAL
                         local_progress = 1.0
-                    elif has_qnap_tasks and qnap_status == "completed":
+                    elif qnap_completed:
                         # QNAP finished downloading - mark as complete
                         state = TorrentState.COMPLETED_LOCAL
                         local_progress = 1.0
                         self._local_downloads.add(torrent_hash)
                         is_local = True
                     elif has_qnap_tasks:
-                        # QNAP is downloading
+                        # QNAP is actively downloading/waiting
                         state = TorrentState.DOWNLOADING_LOCAL
                     elif is_downloading:
                         state = TorrentState.DOWNLOADING_LOCAL
@@ -621,8 +624,19 @@ class SeedrClientWrapper:
                     self._torrents_cache[torrent_hash] = torrent
 
                     # Start auto-download if enabled
-                    if self.auto_download and not is_local and torrent_hash not in self._download_tasks:
+                    # Skip if: already local, already downloading, or QNAP is handling it
+                    should_download = self.auto_download and not is_local and not has_qnap_tasks and torrent_hash not in self._download_tasks
+                    if should_download:
                         self._start_download_task(torrent_hash, folder.id, folder.name, save_path)
+                    elif self.auto_download and not is_local:
+                        # Log why we're not downloading
+                        reasons = []
+                        if has_qnap_tasks:
+                            reasons.append(f"QNAP has tasks (status={qnap_status})")
+                        if torrent_hash in self._download_tasks:
+                            reasons.append("download task already running")
+                        if reasons:
+                            logger.debug(f"Skipping auto-download for {folder.name}: {', '.join(reasons)}")
 
                 # Add queued torrents
                 for queued in self._torrent_queue:
