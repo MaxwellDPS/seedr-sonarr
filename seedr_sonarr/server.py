@@ -60,8 +60,12 @@ class Settings(BaseSettings):
     qnap_dest_folder: str = ""  # Final destination folder on QNAP (e.g., "Multimedia/TV")
 
     # Persistence settings
-    state_file: str = "seedr_state.db"
+    config_path: str = "/config"  # Path for persistent config/state data
+    state_file: str = "seedr_state.db"  # Filename only, will be joined with config_path
     persist_state: bool = True
+
+    # Default categories to create on startup (comma-separated)
+    default_categories: str = "radarr,tv-sonarr"
 
     # Retry settings
     retry_max_attempts: int = 3
@@ -133,19 +137,22 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting Seedr-Sonarr proxy with full lifecycle management...")
 
-    # Create download directory
+    # Create download and config directories
     try:
         os.makedirs(settings.download_path, exist_ok=True)
         os.makedirs(settings.temp_path, exist_ok=True)
+        os.makedirs(settings.config_path, exist_ok=True)
         logger.info(f"Download path: {settings.download_path}")
+        logger.info(f"Config path: {settings.config_path}")
     except OSError as e:
-        logger.warning(f"Could not create download directories: {e}")
+        logger.warning(f"Could not create directories: {e}")
 
-    # Initialize persistence
+    # Initialize persistence - use config_path for state file
     if settings.persist_state:
-        persistence_manager = PersistenceManager(settings.state_file)
+        state_file_path = os.path.join(settings.config_path, settings.state_file)
+        persistence_manager = PersistenceManager(state_file_path)
         await persistence_manager.initialize()
-        logger.info(f"Persistence enabled: {settings.state_file}")
+        logger.info(f"Persistence enabled: {state_file_path}")
 
     # Initialize state manager
     state_manager = StateManager(
@@ -162,6 +169,31 @@ async def lifespan(app: FastAPI):
             "instance_id": cat.instance_id,
         }
     logger.info(f"Loaded {len(created_categories)} categories from persistence")
+
+    # Auto-create default categories if they don't exist
+    if settings.default_categories:
+        for cat_name in settings.default_categories.split(","):
+            cat_name = cat_name.strip()
+            if cat_name and cat_name not in created_categories:
+                instance_id = extract_instance_id(cat_name)
+                save_path = os.path.join(settings.download_path, cat_name)
+                created_categories[cat_name] = {
+                    "savePath": save_path,
+                    "instance_id": instance_id,
+                }
+                # Create the directory
+                try:
+                    os.makedirs(save_path, exist_ok=True)
+                except OSError as e:
+                    logger.warning(f"Could not create category directory {save_path}: {e}")
+                # Persist the category
+                if state_manager:
+                    await state_manager.add_category(CategoryState(
+                        name=cat_name,
+                        save_path=save_path,
+                        instance_id=instance_id,
+                    ))
+                logger.info(f"Auto-created default category: {cat_name} -> {save_path}")
 
     # Create retry and circuit breaker configs
     retry_config = RetryConfig(
