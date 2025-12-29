@@ -141,18 +141,36 @@ async def lifespan(app: FastAPI):
     try:
         os.makedirs(settings.download_path, exist_ok=True)
         os.makedirs(settings.temp_path, exist_ok=True)
-        os.makedirs(settings.config_path, exist_ok=True)
         logger.info(f"Download path: {settings.download_path}")
-        logger.info(f"Config path: {settings.config_path}")
     except OSError as e:
-        logger.warning(f"Could not create directories: {e}")
+        logger.warning(f"Could not create download directories: {e}")
+
+    # Ensure config path exists and is writable
+    config_path = settings.config_path
+    try:
+        os.makedirs(config_path, exist_ok=True)
+        # Test if we can write to the config path
+        test_file = os.path.join(config_path, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+        logger.info(f"Config path: {config_path}")
+    except OSError as e:
+        logger.warning(f"Config path {config_path} not writable: {e}, falling back to /tmp")
+        config_path = "/tmp"
+        os.makedirs(config_path, exist_ok=True)
 
     # Initialize persistence - use config_path for state file
     if settings.persist_state:
-        state_file_path = os.path.join(settings.config_path, settings.state_file)
-        persistence_manager = PersistenceManager(state_file_path)
-        await persistence_manager.initialize()
-        logger.info(f"Persistence enabled: {state_file_path}")
+        state_file_path = os.path.join(config_path, settings.state_file)
+        try:
+            persistence_manager = PersistenceManager(state_file_path)
+            await persistence_manager.initialize()
+            logger.info(f"Persistence enabled: {state_file_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize persistence at {state_file_path}: {e}")
+            logger.warning("Continuing without persistence")
+            persistence_manager = None
 
     # Initialize state manager
     state_manager = StateManager(

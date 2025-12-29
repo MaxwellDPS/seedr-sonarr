@@ -164,6 +164,9 @@ class SeedrClientWrapper:
         self._qnap_client = qnap_client
         self._qnap_temp_folder = qnap_temp_folder
         self._qnap_dest_folder = qnap_dest_folder
+        self._qnap_folder_progress: dict[str, dict] = {}  # folder_name -> {progress, speed, eta, status}
+        self._qnap_last_query: float = 0  # Timestamp of last QNAP query
+        self._qnap_query_interval: float = 5.0  # Query QNAP every 5 seconds
 
         self._client = None
         self._lock = asyncio.Lock()
@@ -405,6 +408,10 @@ class SeedrClientWrapper:
                 if datetime.now().timestamp() - self._last_storage_check > 60:
                     await self._update_storage_info()
 
+                # Update QNAP progress if enabled
+                if self._qnap_client:
+                    await self._update_qnap_progress()
+
                 # Get root folder contents with retry and rate limiting
                 await self._rate_limiter.acquire()
                 contents = await self._retry_handler.with_retry(
@@ -438,7 +445,20 @@ class SeedrClientWrapper:
                     if category and transfer.name:
                         self._name_to_hash_mapping[transfer.name] = torrent_hash
 
+                    # Seedr progress maps to 0-50% of total progress
                     effective_progress = seedr_progress * 0.5
+
+                    # Calculate ETA for Seedr download phase
+                    # Since this is only the first 50%, we need to estimate total time
+                    download_rate = getattr(transfer, 'download_rate', 0) or 0
+                    if download_rate > 0 and size > 0:
+                        # Time remaining for Seedr phase
+                        seedr_remaining = size * (1.0 - seedr_progress)
+                        seedr_eta = int(seedr_remaining / download_rate)
+                        # Double it roughly to account for local download phase
+                        eta = seedr_eta * 2
+                    else:
+                        eta = 8640000  # Unknown
 
                     phase = self._determine_phase(
                         is_queued=False,
@@ -455,8 +475,9 @@ class SeedrClientWrapper:
                         size=size,
                         progress=effective_progress,
                         state=state,
-                        download_speed=getattr(transfer, 'download_rate', 0) or 0,
+                        download_speed=download_rate,
                         upload_speed=getattr(transfer, 'upload_rate', 0) or 0,
+                        eta=eta,
                         seeders=getattr(transfer, 'seeders', 0) or 0,
                         leechers=getattr(transfer, 'leechers', 0) or 0,
                         added_on=int(datetime.now().timestamp()),
@@ -508,32 +529,70 @@ class SeedrClientWrapper:
                     local_progress = self._download_progress.get(torrent_hash, 0.0)
                     is_downloading = torrent_hash in self._download_tasks
 
+                    # Get QNAP progress for this folder if available
+                    qnap_info = self._get_qnap_progress(folder.name) if self._qnap_client else {}
+                    qnap_progress = qnap_info.get("progress", 0.0)
+                    qnap_speed = qnap_info.get("speed", 0)
+                    qnap_eta = qnap_info.get("eta", 8640000)
+                    qnap_status = qnap_info.get("status", "unknown")
+                    has_qnap_tasks = qnap_status in ("downloading", "waiting", "completed")
+
                     if is_local:
                         state = TorrentState.COMPLETED_LOCAL
                         local_progress = 1.0
+                    elif has_qnap_tasks and qnap_status == "completed":
+                        # QNAP finished downloading - mark as complete
+                        state = TorrentState.COMPLETED_LOCAL
+                        local_progress = 1.0
+                        self._local_downloads.add(torrent_hash)
+                        is_local = True
+                    elif has_qnap_tasks:
+                        # QNAP is downloading
+                        state = TorrentState.DOWNLOADING_LOCAL
                     elif is_downloading:
                         state = TorrentState.DOWNLOADING_LOCAL
                     else:
                         state = TorrentState.COMPLETED
 
+                    # Calculate effective progress:
+                    # 0-50%: Seedr download (from internet to Seedr cloud)
+                    # 51-100%: Local download (from Seedr to local, via QNAP or direct)
                     if is_local:
                         effective_progress = 1.0
+                    elif has_qnap_tasks:
+                        # QNAP is handling the download - use QNAP progress for 51-100% range
+                        effective_progress = 0.5 + (qnap_progress * 0.5)
                     elif is_downloading:
                         effective_progress = 0.5 + (local_progress * 0.5)
                     else:
                         effective_progress = 0.5
 
-                    download_speed = 0
-                    if torrent_hash in self._active_downloads:
+                    # Use QNAP speed if available, otherwise use tracked speed
+                    if has_qnap_tasks and qnap_speed > 0:
+                        download_speed = qnap_speed
+                    elif torrent_hash in self._active_downloads:
                         download_speed = self._active_downloads.get(torrent_hash, 0)
+                    else:
+                        download_speed = 0
 
                     phase = self._determine_phase(
                         is_queued=False,
                         seedr_progress=1.0,
-                        is_downloading_local=is_downloading,
+                        is_downloading_local=is_downloading or has_qnap_tasks,
                         is_local=is_local,
                         has_error=torrent_hash in self._last_errors,
                     )
+
+                    # Calculate ETA
+                    if is_local:
+                        eta = 0  # Complete
+                    elif has_qnap_tasks:
+                        eta = qnap_eta  # Use QNAP's ETA
+                    elif download_speed > 0:
+                        remaining = folder.size * (1.0 - effective_progress)
+                        eta = int(remaining / download_speed) if download_speed > 0 else 8640000
+                    else:
+                        eta = 8640000  # Unknown
 
                     torrent = SeedrTorrent(
                         id=str(folder.id),
@@ -543,6 +602,7 @@ class SeedrClientWrapper:
                         progress=effective_progress if self.auto_download else 1.0,
                         state=state,
                         download_speed=download_speed,
+                        eta=eta,
                         added_on=timestamp,
                         completion_on=timestamp if is_local else 0,
                         save_path=save_path,
@@ -652,6 +712,90 @@ class SeedrClientWrapper:
             self._active_downloads.pop(torrent_hash, None)
 
         task.add_done_callback(cleanup)
+
+    async def _update_qnap_progress(self):
+        """Query QNAP Download Station and update progress tracking for active tasks."""
+        if not self._qnap_client:
+            return
+
+        now = datetime.now().timestamp()
+        if now - self._qnap_last_query < self._qnap_query_interval:
+            return  # Rate limit queries
+
+        self._qnap_last_query = now
+
+        try:
+            tasks = await self._qnap_client.query_tasks(limit=200)
+
+            # Group tasks by destination folder
+            folder_tasks: dict[str, list] = {}
+            for task in tasks:
+                # Extract folder name from destination path
+                # e.g., "plex/downloads/tv-sonarr/Show.Name.S01E01" -> "Show.Name.S01E01"
+                dest = task.destination or ""
+                if "/" in dest:
+                    folder_name = dest.rsplit("/", 1)[-1]
+                else:
+                    folder_name = dest
+
+                if folder_name:
+                    if folder_name not in folder_tasks:
+                        folder_tasks[folder_name] = []
+                    folder_tasks[folder_name].append(task)
+
+            # Calculate aggregate progress per folder
+            new_progress = {}
+            for folder_name, tasks_list in folder_tasks.items():
+                total_size = sum(t.size for t in tasks_list)
+                total_downloaded = sum(t.downloaded for t in tasks_list)
+                total_speed = sum(t.download_speed for t in tasks_list)
+
+                if total_size > 0:
+                    progress = total_downloaded / total_size
+                else:
+                    progress = 0.0
+
+                # Calculate ETA based on remaining bytes and current speed
+                remaining = total_size - total_downloaded
+                if total_speed > 0:
+                    eta = int(remaining / total_speed)
+                else:
+                    eta = 8640000  # Unknown/infinite
+
+                # Determine overall status
+                statuses = [t.status.name for t in tasks_list]
+                if all(s == "COMPLETED" for s in statuses):
+                    status = "completed"
+                elif any(s == "ERROR" for s in statuses):
+                    status = "error"
+                elif any(s == "DOWNLOADING" for s in statuses):
+                    status = "downloading"
+                else:
+                    status = "waiting"
+
+                new_progress[folder_name] = {
+                    "progress": progress,
+                    "speed": total_speed,
+                    "eta": eta,
+                    "status": status,
+                    "total_size": total_size,
+                    "downloaded": total_downloaded,
+                    "task_count": len(tasks_list),
+                }
+
+            self._qnap_folder_progress = new_progress
+
+        except Exception as e:
+            logger.warning(f"Failed to query QNAP tasks: {e}")
+
+    def _get_qnap_progress(self, folder_name: str) -> dict:
+        """Get QNAP download progress for a folder."""
+        return self._qnap_folder_progress.get(folder_name, {
+            "progress": 0.0,
+            "speed": 0,
+            "eta": 8640000,
+            "status": "unknown",
+        })
 
     async def _download_folder(self, torrent_hash: str, folder_id: str, folder_name: str, save_path: str):
         """Download all files from a Seedr folder to local storage.
