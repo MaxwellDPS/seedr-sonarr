@@ -574,13 +574,18 @@ class SeedrClientWrapper:
     def _start_download_task(self, torrent_hash: str, folder_id: int, folder_name: str, save_path: str):
         """Start a background task to download a folder from Seedr."""
         if torrent_hash in self._download_tasks:
+            logger.debug(f"Download task already running for {folder_name}")
             return
 
         # Check if we need to wait before retrying (cooldown after failures)
         retry_after = self._download_retry_after.get(torrent_hash, 0)
-        if retry_after > datetime.now().timestamp():
+        now = datetime.now().timestamp()
+        if retry_after > now:
+            remaining = int(retry_after - now)
+            logger.debug(f"Download for {folder_name} in cooldown, {remaining}s remaining")
             return  # Still in cooldown period
 
+        logger.info(f"Starting download task for {folder_name} (folder_id={folder_id})")
         task = asyncio.create_task(
             self._download_folder(torrent_hash, str(folder_id), folder_name, save_path)
         )
@@ -1386,10 +1391,15 @@ class SeedrClientWrapper:
 
     def get_stats(self) -> dict:
         """Get client statistics."""
+        now = datetime.now().timestamp()
+        cooldowns = {
+            h: int(t - now) for h, t in self._download_retry_after.items() if t > now
+        }
         return {
             "torrents_cached": len(self._torrents_cache),
             "queue_size": len(self._torrent_queue),
             "active_downloads": len(self._download_tasks),
+            "active_download_hashes": list(self._download_tasks.keys()),
             "local_downloads": len(self._local_downloads),
             "hash_mappings": len(self._hash_mapping),
             "storage_used_mb": self._storage_used / 1024 / 1024,
@@ -1400,5 +1410,8 @@ class SeedrClientWrapper:
             "errors": {
                 "total_torrents_with_errors": len(self._error_counts),
                 "total_error_count": sum(self._error_counts.values()),
+                "error_hashes": list(self._error_counts.keys()),
             },
+            "cooldowns": cooldowns,
+            "download_progress": dict(self._download_progress),
         }
