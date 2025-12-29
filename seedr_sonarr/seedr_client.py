@@ -939,6 +939,15 @@ class SeedrClientWrapper:
                     # Create the destination folder on the local filesystem
                     # This is required because QNAP needs the folder to exist before downloading
                     os.makedirs(local_dest, exist_ok=True)
+                    # Set permissive permissions so all users can read/write
+                    try:
+                        os.chmod(local_dest, 0o777)
+                        # Also set permissions on parent category folder if it exists
+                        if category:
+                            category_folder = os.path.join(self.download_path, category)
+                            os.chmod(category_folder, 0o777)
+                    except OSError as e:
+                        logger.warning(f"Could not set permissions on {local_dest}: {e}")
                     logger.info(f"Created local destination folder: {local_dest}")
 
                     logger.info(f"QNAP destination folder: {dest_folder} (category={category}, torrent={folder_name})")
@@ -1079,6 +1088,10 @@ class SeedrClientWrapper:
 
                     dest_dir = os.path.join(save_path, folder_name)
                     os.makedirs(dest_dir, exist_ok=True)
+                    try:
+                        os.chmod(dest_dir, 0o777)
+                    except OSError:
+                        pass
 
                     # Get folder contents with retry and rate limiting
                     await self._rate_limiter.acquire()
@@ -1436,6 +1449,10 @@ class SeedrClientWrapper:
                         self._name_to_hash_mapping[name] = torrent_hash
                     cat_path = os.path.join(self.download_path, category)
                     os.makedirs(cat_path, exist_ok=True)
+                    try:
+                        os.chmod(cat_path, 0o777)
+                    except OSError:
+                        pass
 
                 with LogContext(torrent_hash=torrent_hash, torrent_name=name, category=category):
                     logger.info(f"Added torrent: {name} (hash: {torrent_hash}, instance: {instance_id})")
@@ -1624,6 +1641,10 @@ class SeedrClientWrapper:
                         if queued.category:
                             cat_path = os.path.join(self.download_path, queued.category)
                             os.makedirs(cat_path, exist_ok=True)
+                            try:
+                                os.chmod(cat_path, 0o777)
+                            except OSError:
+                                pass
 
                         self._torrents_cache.pop(queue_hash, None)
 

@@ -154,10 +154,16 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting Seedr-Sonarr proxy with full lifecycle management...")
 
-    # Create download and config directories
+    # Create download and config directories with permissive permissions
     try:
         os.makedirs(settings.download_path, exist_ok=True)
         os.makedirs(settings.temp_path, exist_ok=True)
+        # Set permissive permissions so all users can read/write
+        try:
+            os.chmod(settings.download_path, 0o777)
+            os.chmod(settings.temp_path, 0o777)
+        except OSError:
+            pass  # May fail if not owner
         logger.info(f"Download path: {settings.download_path}")
     except OSError as e:
         logger.warning(f"Could not create download directories: {e}")
@@ -216,9 +222,10 @@ async def lifespan(app: FastAPI):
                     "savePath": save_path,
                     "instance_id": instance_id,
                 }
-                # Create the directory
+                # Create the directory with permissive permissions
                 try:
                     os.makedirs(save_path, exist_ok=True)
+                    os.chmod(save_path, 0o777)
                 except OSError as e:
                     logger.warning(f"Could not create category directory {save_path}: {e}")
                 # Persist the category
@@ -997,6 +1004,7 @@ async def torrents_create_category(
 
     try:
         os.makedirs(save_path, exist_ok=True)
+        os.chmod(save_path, 0o777)
         logger.info(f"Created category: {category} -> {save_path} (instance: {instance_id})")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
@@ -1048,6 +1056,7 @@ async def torrents_edit_category(
 
     try:
         os.makedirs(save_path, exist_ok=True)
+        os.chmod(save_path, 0o777)
         logger.info(f"Edited category: {category} -> {save_path}")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
