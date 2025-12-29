@@ -688,7 +688,9 @@ class SeedrClientWrapper:
                     qnap_tasks = []  # Track QNAP task IDs for this torrent
 
                     # Determine QNAP destination folder
-                    # Use category-based subfolder if available
+                    # Structure: {qnap_dest_folder}/{category}/{torrent_name}/
+                    # Example: plex/downloads/sonarr/Show.S01E01/
+                    # This maps to /downloads/sonarr/Show.S01E01/ in containers
                     category = self._category_mapping.get(torrent_hash, "")
                     if category and self._qnap_dest_folder:
                         dest_folder = f"{self._qnap_dest_folder}/{category}/{folder_name}"
@@ -696,6 +698,8 @@ class SeedrClientWrapper:
                         dest_folder = f"{self._qnap_dest_folder}/{folder_name}"
                     else:
                         dest_folder = folder_name
+
+                    logger.info(f"QNAP destination folder: {dest_folder} (category={category})")
 
                     for idx, file in enumerate(folder.files):
                         try:
@@ -804,6 +808,14 @@ class SeedrClientWrapper:
 
                     # Clean up QNAP task mapping
                     self._qnap_task_mapping.pop(torrent_hash, None)
+
+                    # Remove completed tasks from QNAP Download Station
+                    for task_info in qnap_tasks:
+                        try:
+                            await self._qnap_client.remove_task(task_info["task_id"])
+                            logger.debug(f"Removed QNAP task {task_info['task_id']}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove QNAP task {task_info['task_id']}: {e}")
 
                     # Check if all files were downloaded successfully
                     if failed_files:
