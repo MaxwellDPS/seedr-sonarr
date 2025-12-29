@@ -114,6 +114,21 @@ async def _cleanup_expired_sessions():
             expired = [sid for sid, expiry in sessions.items() if now > expiry]
             for sid in expired:
                 sessions.pop(sid, None)
+
+
+async def _periodic_queue_processor():
+    """Periodically process the torrent queue to add queued items to Seedr."""
+    while True:
+        try:
+            await asyncio.sleep(QUEUE_PROCESS_INTERVAL)
+            if seedr_client and seedr_client._torrent_queue:
+                queue_size = len(seedr_client._torrent_queue)
+                logger.debug(f"Periodic queue check: {queue_size} torrents in queue")
+                await seedr_client._process_queue()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Error in periodic queue processor: {e}")
             if expired:
                 logger.debug(f"Cleaned up {len(expired)} expired sessions")
         except asyncio.CancelledError:
