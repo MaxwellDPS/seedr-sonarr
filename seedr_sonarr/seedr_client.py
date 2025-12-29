@@ -164,7 +164,6 @@ class SeedrClientWrapper:
         self._qnap_client = qnap_client
         self._qnap_temp_folder = qnap_temp_folder
         self._qnap_dest_folder = qnap_dest_folder
-        self._qnap_task_mapping: dict[str, str] = {}  # torrent_hash -> qnap_task_id
 
         self._client = None
         self._lock = asyncio.Lock()
