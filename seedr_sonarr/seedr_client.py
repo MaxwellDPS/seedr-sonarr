@@ -1271,21 +1271,25 @@ class SeedrClientWrapper:
     async def set_category_mapping(self, torrent_hash: str, category: str, instance_id: str = ""):
         """Thread-safe method to set category and instance mapping for a torrent."""
         async with self._mapping_lock:
-            self._category_mapping[torrent_hash] = category
-            self._instance_mapping[torrent_hash] = instance_id or extract_instance_id(category)
+            # Normalize hash to uppercase for consistent lookups
+            normalized_hash = torrent_hash.upper()
+            self._category_mapping[normalized_hash] = category
+            self._instance_mapping[normalized_hash] = instance_id or extract_instance_id(category)
 
     async def get_category_mapping(self, torrent_hash: str) -> tuple[str, str]:
         """Thread-safe method to get category and instance mapping for a torrent."""
         async with self._mapping_lock:
-            category = self._category_mapping.get(torrent_hash, "")
-            instance_id = self._instance_mapping.get(torrent_hash, "")
+            normalized_hash = torrent_hash.upper()
+            category = self._category_mapping.get(normalized_hash, "")
+            instance_id = self._instance_mapping.get(normalized_hash, "")
             return category, instance_id
 
     async def remove_mapping(self, torrent_hash: str):
         """Thread-safe method to remove category and instance mapping for a torrent."""
         async with self._mapping_lock:
-            self._category_mapping.pop(torrent_hash, None)
-            self._instance_mapping.pop(torrent_hash, None)
+            normalized_hash = torrent_hash.upper()
+            self._category_mapping.pop(normalized_hash, None)
+            self._instance_mapping.pop(normalized_hash, None)
 
     async def _add_to_queue(
         self,
