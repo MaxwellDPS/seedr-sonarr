@@ -114,6 +114,12 @@ async def _cleanup_expired_sessions():
             expired = [sid for sid, expiry in sessions.items() if now > expiry]
             for sid in expired:
                 sessions.pop(sid, None)
+            if expired:
+                logger.debug(f"Cleaned up {len(expired)} expired sessions")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Error in session cleanup: {e}")
 
 
 async def _periodic_queue_processor():
@@ -129,18 +135,12 @@ async def _periodic_queue_processor():
             break
         except Exception as e:
             logger.warning(f"Error in periodic queue processor: {e}")
-            if expired:
-                logger.debug(f"Cleaned up {len(expired)} expired sessions")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"Error in session cleanup: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global seedr_client, state_manager, persistence_manager, activity_log_handler, qnap_client, _session_cleanup_task
+    global seedr_client, state_manager, persistence_manager, activity_log_handler, qnap_client, _session_cleanup_task, _queue_process_task
 
     # Setup logging first
     activity_log_handler = setup_logging(
@@ -293,12 +293,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize Seedr client: {e}")
 
-    # Start session cleanup task
+    # Start background tasks
     _session_cleanup_task = asyncio.create_task(_cleanup_expired_sessions())
+    _queue_process_task = asyncio.create_task(_periodic_queue_processor())
 
     yield
 
-    # Cancel session cleanup task
+    # Cancel background tasks
+    if _queue_process_task:
+        _queue_process_task.cancel()
+        try:
+            await _queue_process_task
+        except asyncio.CancelledError:
+            pass
+
     if _session_cleanup_task:
         _session_cleanup_task.cancel()
         try:
