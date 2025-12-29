@@ -774,6 +774,12 @@ async def torrents_add(
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # Log all incoming parameters for debugging
+    logger.info(
+        f"torrents/add request: category='{category}', savepath='{savepath}', "
+        f"tags='{tags}', has_urls={urls is not None}, has_torrents={torrents is not None}"
+    )
+
     try:
         added_hashes = []
         instance_id = extract_instance_id(category or "")

@@ -590,6 +590,17 @@ class SeedrClientWrapper:
                             )
                             # Remove from pending persistence
                             await self._state_manager.delete_qnap_pending(torrent_hash)
+
+                            # NOW delete from Seedr since QNAP is done downloading
+                            if self.delete_after_download:
+                                try:
+                                    folder_id = pending["folder_id"]
+                                    await self._client.delete_folder(folder_id)
+                                    logger.info(f"QNAP complete - deleted from Seedr: {pending['folder_name']}")
+                                    await self._update_storage_info()
+                                    await self._process_queue()
+                                except Exception as e:
+                                    logger.warning(f"Failed to delete from Seedr after QNAP completion: {e}")
                     elif has_qnap_tasks:
                         # QNAP is actively downloading/waiting
                         state = TorrentState.DOWNLOADING_LOCAL
@@ -767,6 +778,19 @@ class SeedrClientWrapper:
                                 )
                                 # Remove from pending persistence
                                 await self._state_manager.delete_qnap_pending(pending_hash)
+
+                            # NOW delete from Seedr since QNAP is done downloading
+                            if self.delete_after_download:
+                                try:
+                                    folder_id = pending["folder_id"]
+                                    await self._client.delete_folder(folder_id)
+                                    logger.info(f"QNAP complete (pending) - deleted from Seedr: {pending['folder_name']}")
+                                    await self._update_storage_info()
+                                    await self._process_queue()
+                                except Exception as e:
+                                    # Folder might already be deleted, that's OK
+                                    logger.debug(f"Could not delete from Seedr after QNAP completion: {e}")
+
                             # Mark for removal after iteration
                             pending_to_remove.append(pending_hash)
                             phase = TorrentPhase.COMPLETED
@@ -1223,18 +1247,13 @@ class SeedrClientWrapper:
                         f"category: {category}, instance_id: {pending_instance_id}"
                     )
 
-                    # Delete from Seedr after handing off to QNAP
-                    # Only delete if ALL files were successfully added to QNAP
-                    if self.delete_after_download and not failed_files:
-                        try:
-                            await self._client.delete_folder(folder_id)
-                            logger.info(f"Deleted from Seedr: {folder_name}")
-                            await self._update_storage_info()
-                            await self._process_queue()
-                        except Exception as e:
-                            logger.warning(f"Failed to delete from Seedr: {e}")
-                    elif failed_files:
-                        logger.warning(f"Not deleting {folder_name} from Seedr due to {len(failed_files)} failed file(s)")
+                    # IMPORTANT: Do NOT delete from Seedr yet!
+                    # QNAP downloads from Seedr URLs, so we must wait until QNAP completes.
+                    # The deletion will happen when we detect QNAP has completed in get_torrents().
+                    if failed_files:
+                        logger.warning(f"Some files failed to add to QNAP: {len(failed_files)} failed file(s)")
+                    else:
+                        logger.info(f"All files added to QNAP. Will delete from Seedr when QNAP completes.")
 
             except asyncio.CancelledError:
                 logger.info(f"QNAP download cancelled: {folder_name}")
