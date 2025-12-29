@@ -1634,14 +1634,58 @@ class SeedrClientWrapper:
                     await self._circuit_breaker.record_failure()
                     error_str = str(e).lower()
 
-                    # Handle seedrcc parsing errors - usually means API returned an error response
+                    # Handle seedrcc parsing errors - usually means API returned success but lib can't parse
                     if 'missing' in error_str and 'positional argument' in error_str:
-                        logger.error(f"Seedr API returned unexpected response (likely error or duplicate): {e}")
-                        # This often means the torrent already exists or was rejected
-                        # Queue it for retry later
-                        return await self._add_to_queue(
-                            magnet_link, torrent_file, category, name, estimated_size, instance_id
-                        )
+                        logger.warning(f"Seedr API response parsing failed: {e}")
+                        # The torrent was likely added successfully - check Seedr for it
+                        # First, refresh our knowledge of Seedr contents
+                        try:
+                            await asyncio.sleep(1)  # Brief delay for Seedr to register
+                            contents = await self._client.list_contents()
+
+                            # Search for the torrent by name in transfers (active) or folders (complete)
+                            normalized_search = normalize_folder_name(name)
+                            found_hash = None
+
+                            for transfer in getattr(contents, 'transfers', []):
+                                if normalize_folder_name(transfer.name) == normalized_search:
+                                    found_hash = f"SEEDR{transfer.id:016X}".upper()
+                                    logger.info(f"Found torrent in Seedr transfers after parse error: {name} -> {found_hash}")
+                                    break
+
+                            if not found_hash:
+                                for folder in getattr(contents, 'folders', []):
+                                    if normalize_folder_name(folder.name) == normalized_search:
+                                        found_hash = f"SEEDR{folder.id:016X}".upper()
+                                        logger.info(f"Found torrent in Seedr folders after parse error: {name} -> {found_hash}")
+                                        break
+
+                            if found_hash:
+                                # Torrent exists! Save mappings and return success
+                                if name and name != "Unknown Torrent":
+                                    self._name_to_hash_mapping[normalized_search] = found_hash
+                                if category:
+                                    self._category_mapping[found_hash] = category
+                                    self._instance_mapping[found_hash] = instance_id
+                                    cat_path = os.path.join(self.download_path, category)
+                                    os.makedirs(cat_path, exist_ok=True)
+                                    try:
+                                        os.chmod(cat_path, 0o777)
+                                    except OSError:
+                                        pass
+                                logger.info(f"Successfully added torrent (recovered from parse error): {name} -> {found_hash}")
+                                return found_hash
+                            else:
+                                # Not found - might be processing, queue for later check
+                                logger.warning(f"Torrent not yet visible in Seedr, queuing for retry: {name}")
+                                return await self._add_to_queue(
+                                    magnet_link, torrent_file, category, name, estimated_size, instance_id
+                                )
+                        except Exception as check_err:
+                            logger.warning(f"Failed to verify torrent in Seedr: {check_err}, queuing")
+                            return await self._add_to_queue(
+                                magnet_link, torrent_file, category, name, estimated_size, instance_id
+                            )
 
                     if 'space' in error_str or 'storage' in error_str or 'limit' in error_str or 'full' in error_str:
                         logger.warning(f"Seedr storage full, queuing: {name}")
@@ -1885,12 +1929,49 @@ class SeedrClientWrapper:
                             logger.info(f"Torrent already in Seedr (duplicate): {queued.name}")
                             # Don't re-queue, treat as success
                         elif 'missing' in error_str and 'positional argument' in error_str:
-                            # seedrcc parsing error - API returned unexpected response
-                            # This often means the torrent was actually added but response parsing failed
-                            logger.warning(f"Seedr API returned unexpected response for {queued.name} (may have been added anyway)")
-                            # Only retry a few times since it might actually be in Seedr
-                            if queued.retry_count < 2:
-                                self._torrent_queue.append(queued)
+                            # seedrcc parsing error - API returned success but lib can't parse
+                            # Check if the torrent was actually added to Seedr
+                            logger.warning(f"Seedr API response parsing failed for {queued.name}, checking if added...")
+                            try:
+                                await asyncio.sleep(1)
+                                contents = await self._client.list_contents()
+                                normalized_search = normalize_folder_name(queued.name)
+                                found = False
+
+                                for transfer in getattr(contents, 'transfers', []):
+                                    if normalize_folder_name(transfer.name) == normalized_search:
+                                        found_hash = f"SEEDR{transfer.id:016X}".upper()
+                                        logger.info(f"Queue item found in Seedr transfers: {queued.name} -> {found_hash}")
+                                        # Save mappings
+                                        self._name_to_hash_mapping[normalized_search] = found_hash
+                                        if queued.category:
+                                            self._category_mapping[found_hash] = queued.category
+                                            self._instance_mapping[found_hash] = queued.instance_id
+                                        found = True
+                                        break
+
+                                if not found:
+                                    for folder in getattr(contents, 'folders', []):
+                                        if normalize_folder_name(folder.name) == normalized_search:
+                                            found_hash = f"SEEDR{folder.id:016X}".upper()
+                                            logger.info(f"Queue item found in Seedr folders: {queued.name} -> {found_hash}")
+                                            self._name_to_hash_mapping[normalized_search] = found_hash
+                                            if queued.category:
+                                                self._category_mapping[found_hash] = queued.category
+                                                self._instance_mapping[found_hash] = queued.instance_id
+                                            found = True
+                                            break
+
+                                if not found and queued.retry_count < 2:
+                                    # Not found yet, might still be processing
+                                    logger.warning(f"Queue item not yet visible in Seedr, will retry: {queued.name}")
+                                    self._torrent_queue.append(queued)
+                                elif found:
+                                    logger.info(f"Queue item successfully added to Seedr (recovered): {queued.name}")
+                            except Exception as check_err:
+                                logger.warning(f"Failed to verify queue item in Seedr: {check_err}")
+                                if queued.retry_count < 2:
+                                    self._torrent_queue.append(queued)
                         else:
                             logger.error(f"Failed to add queued torrent: {e}")
                             # Re-queue if under max retries
