@@ -320,6 +320,8 @@ COMPONENT_LOG_LEVELS = {
     "aiohttp": "WARNING",
     "aiohttp.client": "WARNING",
     "aiosqlite": "WARNING",
+    "httpx": "WARNING",
+    "httpcore": "WARNING",
     "uvicorn": "INFO",
     "uvicorn.access": "WARNING",
     "uvicorn.error": "INFO",
