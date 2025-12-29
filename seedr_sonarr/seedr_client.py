@@ -917,6 +917,17 @@ class SeedrClientWrapper:
                     # The local /downloads path maps to plex/downloads on QNAP via the bind mount.
                     category = self._category_mapping.get(torrent_hash, "")
 
+                    # If category not in mapping, try to extract from save_path
+                    # save_path is like /downloads/tv-sonarr, so strip download_path prefix
+                    if not category and save_path and save_path != self.download_path:
+                        # Extract category from save_path (e.g., /downloads/tv-sonarr -> tv-sonarr)
+                        relative_path = save_path.replace(self.download_path, "").strip("/")
+                        if relative_path:
+                            category = relative_path.split("/")[0]
+                            logger.info(f"Extracted category from save_path: {category}")
+                            # Store it for future lookups
+                            self._category_mapping[torrent_hash] = category
+
                     # Build local path and create directory
                     if category:
                         local_dest = os.path.join(self.download_path, category, folder_name)
