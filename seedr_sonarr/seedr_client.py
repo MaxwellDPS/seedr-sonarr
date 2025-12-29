@@ -25,6 +25,7 @@ from .state import TorrentPhase, extract_instance_id
 
 if TYPE_CHECKING:
     from .state import StateManager
+    from .qnap_client import QnapDownloadStationClient
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,10 @@ class SeedrClientWrapper:
         state_manager: Optional["StateManager"] = None,
         retry_config: Optional[RetryConfig] = None,
         circuit_config: Optional[CircuitBreakerConfig] = None,
+        # QNAP Download Station settings
+        qnap_client: Optional["QnapDownloadStationClient"] = None,
+        qnap_temp_folder: str = "Download",
+        qnap_dest_folder: str = "",
     ):
         self.email = email
         self.password = password
@@ -153,6 +158,12 @@ class SeedrClientWrapper:
         self.delete_after_download = delete_after_download
         self.storage_buffer_mb = storage_buffer_mb
         self.storage_buffer_bytes = storage_buffer_mb * 1024 * 1024
+
+        # QNAP Download Station client (optional - if set, uses QNAP for local downloads)
+        self._qnap_client = qnap_client
+        self._qnap_temp_folder = qnap_temp_folder
+        self._qnap_dest_folder = qnap_dest_folder
+        self._qnap_task_mapping: dict[str, str] = {}  # torrent_hash -> qnap_task_id
 
         self._client = None
         self._lock = asyncio.Lock()
@@ -192,6 +203,9 @@ class SeedrClientWrapper:
 
         # Hash mapping: queue_hash -> real_hash (for Sonarr tracking)
         self._hash_mapping: dict[str, str] = {}
+
+        # Name to hash mapping: torrent_name -> original_hash (for folder transition tracking)
+        self._name_to_hash_mapping: dict[str, str] = {}
 
         # Storage info cache
         self._storage_used: int = 0
@@ -250,13 +264,16 @@ class SeedrClientWrapper:
             return
 
         try:
-            # Restore local downloads
+            # Restore local downloads and mappings
             for torrent in await self._state_manager.get_torrents():
                 if torrent.phase == TorrentPhase.COMPLETED:
                     self._local_downloads.add(torrent.hash)
                 if torrent.category:
                     self._category_mapping[torrent.hash] = torrent.category
                     self._instance_mapping[torrent.hash] = torrent.instance_id
+                    # Restore name → hash mapping for folder transitions
+                    if torrent.name:
+                        self._name_to_hash_mapping[torrent.name] = torrent.hash
 
             # Restore queue
             for queued in await self._state_manager.get_queue():
@@ -417,6 +434,10 @@ class SeedrClientWrapper:
                     category = self._category_mapping.get(torrent_hash, "")
                     instance_id = self._instance_mapping.get(torrent_hash, extract_instance_id(category))
 
+                    # Track name → hash mapping for folder transition
+                    if category and transfer.name:
+                        self._name_to_hash_mapping[transfer.name] = torrent_hash
+
                     effective_progress = seedr_progress * 0.5
 
                     phase = self._determine_phase(
@@ -458,8 +479,28 @@ class SeedrClientWrapper:
                     last_update = folder.last_update
                     timestamp = int(last_update.timestamp()) if last_update else int(datetime.now().timestamp())
 
+                    # Try to get category from direct mapping first
                     category = self._category_mapping.get(torrent_hash, "")
-                    instance_id = self._instance_mapping.get(torrent_hash, extract_instance_id(category))
+                    instance_id = self._instance_mapping.get(torrent_hash, "")
+
+                    # If no category found, try to look up by name (for hash transitions)
+                    if not category and folder.name in self._name_to_hash_mapping:
+                        original_hash = self._name_to_hash_mapping[folder.name]
+                        category = self._category_mapping.get(original_hash, "")
+                        instance_id = self._instance_mapping.get(original_hash, "")
+                        if category:
+                            # Copy mapping to new hash for future lookups
+                            self._category_mapping[torrent_hash] = category
+                            self._instance_mapping[torrent_hash] = instance_id
+                            # Also update name mapping to point to new hash
+                            self._name_to_hash_mapping[folder.name] = torrent_hash
+                            # Persist the hash transition
+                            if self._state_manager:
+                                await self._state_manager.add_hash_mapping(original_hash, torrent_hash)
+                            logger.info(f"Hash transition detected: {original_hash} -> {torrent_hash} (category: {category})")
+
+                    if not instance_id:
+                        instance_id = extract_instance_id(category)
                     save_path = self._get_save_path(category)
                     content_path = os.path.join(save_path, folder.name)
 
@@ -613,7 +654,212 @@ class SeedrClientWrapper:
         task.add_done_callback(cleanup)
 
     async def _download_folder(self, torrent_hash: str, folder_id: str, folder_name: str, save_path: str):
-        """Download all files from a Seedr folder to local storage."""
+        """Download all files from a Seedr folder to local storage.
+
+        If QNAP client is configured, uses QNAP Download Station to pull files.
+        Otherwise, downloads directly via HTTP.
+        """
+        if self._qnap_client:
+            await self._download_folder_via_qnap(torrent_hash, folder_id, folder_name, save_path)
+        else:
+            await self._download_folder_direct(torrent_hash, folder_id, folder_name, save_path)
+
+    async def _download_folder_via_qnap(self, torrent_hash: str, folder_id: str, folder_name: str, save_path: str):
+        """Download files from Seedr using QNAP Download Station."""
+        from .qnap_client import QnapTaskStatus
+
+        async with self._download_lock:
+            try:
+                with LogContext(torrent_hash=torrent_hash, torrent_name=folder_name):
+                    logger.info(f"Starting QNAP download of {folder_name}")
+
+                    # Get folder contents to get download URLs
+                    await self._rate_limiter.acquire()
+                    folder = await self._retry_handler.with_retry(
+                        operation=lambda: self._client.list_contents(folder_id),
+                        operation_id=f"list_folder_{folder_id}",
+                        max_attempts=3,
+                    )
+
+                    total_size = sum(f.size for f in folder.files)
+                    total_downloaded = 0
+                    failed_files = []
+                    qnap_tasks = []  # Track QNAP task IDs for this torrent
+
+                    # Determine QNAP destination folder
+                    # Use category-based subfolder if available
+                    category = self._category_mapping.get(torrent_hash, "")
+                    if category and self._qnap_dest_folder:
+                        dest_folder = f"{self._qnap_dest_folder}/{category}/{folder_name}"
+                    elif self._qnap_dest_folder:
+                        dest_folder = f"{self._qnap_dest_folder}/{folder_name}"
+                    else:
+                        dest_folder = folder_name
+
+                    for idx, file in enumerate(folder.files):
+                        try:
+                            # Check if file is marked as lost/unavailable
+                            if hasattr(file, 'is_lost') and file.is_lost:
+                                logger.warning(f"File {file.name} is marked as lost/unavailable, skipping")
+                                failed_files.append(file.name)
+                                continue
+
+                            folder_file_id = getattr(file, 'folder_file_id', None)
+                            if not folder_file_id:
+                                logger.error(f"File {file.name} has no folder_file_id, skipping")
+                                failed_files.append(file.name)
+                                continue
+
+                            # Get download URL from Seedr
+                            await self._rate_limiter.acquire()
+                            file_info = await self._retry_handler.with_retry(
+                                operation=lambda fid=folder_file_id: self._client.fetch_file(str(fid)),
+                                operation_id=f"fetch_file_{idx}",
+                                max_attempts=1,
+                                should_retry=lambda e: self._is_file_fetch_retryable(e),
+                            )
+
+                            if not file_info or not hasattr(file_info, 'url') or not file_info.url:
+                                logger.warning(f"File {file.name} has no download URL, may not be ready")
+                                failed_files.append(file.name)
+                                continue
+
+                            download_url = file_info.url
+
+                            # Add download task to QNAP
+                            task_id = await self._qnap_client.add_download(
+                                url=download_url,
+                                temp_folder=self._qnap_temp_folder,
+                                dest_folder=dest_folder,
+                            )
+
+                            if task_id:
+                                qnap_tasks.append({
+                                    "task_id": task_id,
+                                    "file_name": file.name,
+                                    "size": file.size,
+                                })
+                                logger.info(f"Added QNAP task {task_id} for {file.name}")
+                            else:
+                                logger.error(f"Failed to add QNAP task for {file.name}")
+                                failed_files.append(file.name)
+
+                        except Exception as e:
+                            logger.error(f"Error adding QNAP download for {file.name}: {e}")
+                            self._record_error(torrent_hash, str(e))
+                            failed_files.append(file.name)
+
+                    if not qnap_tasks:
+                        logger.error(f"No QNAP tasks created for {folder_name}")
+                        self._record_error(torrent_hash, "No QNAP tasks created")
+                        return
+
+                    # Store task mapping for status tracking
+                    self._qnap_task_mapping[torrent_hash] = ",".join(t["task_id"] for t in qnap_tasks)
+
+                    # Monitor QNAP tasks until completion
+                    logger.info(f"Monitoring {len(qnap_tasks)} QNAP tasks for {folder_name}")
+                    completed_tasks = set()
+                    max_poll_time = 3600 * 6  # 6 hours max
+                    poll_start = datetime.now().timestamp()
+
+                    while len(completed_tasks) < len(qnap_tasks):
+                        if datetime.now().timestamp() - poll_start > max_poll_time:
+                            logger.error(f"QNAP download timed out for {folder_name}")
+                            self._record_error(torrent_hash, "QNAP download timeout")
+                            return
+
+                        total_progress = 0
+                        total_speed = 0
+
+                        for task_info in qnap_tasks:
+                            if task_info["task_id"] in completed_tasks:
+                                total_progress += task_info["size"]
+                                continue
+
+                            task_status = await self._qnap_client.get_task_status(task_info["task_id"])
+                            if not task_status:
+                                continue
+
+                            if task_status.status == QnapTaskStatus.COMPLETED:
+                                completed_tasks.add(task_info["task_id"])
+                                total_progress += task_info["size"]
+                                logger.info(f"QNAP task completed: {task_info['file_name']}")
+                            elif task_status.status == QnapTaskStatus.ERROR:
+                                logger.error(f"QNAP task failed: {task_info['file_name']} - {task_status.error_message}")
+                                failed_files.append(task_info["file_name"])
+                                completed_tasks.add(task_info["task_id"])  # Mark as done (failed)
+                            else:
+                                # Still downloading
+                                total_progress += task_status.downloaded
+                                total_speed += task_status.download_speed
+
+                        # Update progress
+                        if total_size > 0:
+                            self._download_progress[torrent_hash] = total_progress / total_size
+                        self._active_downloads[torrent_hash] = total_speed
+
+                        await asyncio.sleep(5)  # Poll every 5 seconds
+
+                    # Clean up QNAP task mapping
+                    self._qnap_task_mapping.pop(torrent_hash, None)
+
+                    # Check if all files were downloaded successfully
+                    if failed_files:
+                        logger.error(
+                            f"QNAP download incomplete for {folder_name}: "
+                            f"{len(failed_files)} file(s) failed: {failed_files}"
+                        )
+                        error_count = self._error_counts.get(torrent_hash, 1)
+                        cooldown = min(60 * (2 ** (error_count - 1)), 600)
+                        self._download_retry_after[torrent_hash] = datetime.now().timestamp() + cooldown
+                        logger.info(f"Will retry QNAP download of {folder_name} in {cooldown}s")
+                        return
+
+                    # Download complete
+                    self._download_progress[torrent_hash] = 1.0
+                    self._local_downloads.add(torrent_hash)
+                    logger.info(f"QNAP download complete: {folder_name}")
+
+                    # Clear errors
+                    self._error_counts.pop(torrent_hash, None)
+                    self._last_errors.pop(torrent_hash, None)
+                    self._download_retry_after.pop(torrent_hash, None)
+
+                    # Persist local download
+                    if self._state_manager:
+                        await self._state_manager.mark_local_download(torrent_hash)
+
+                    # Delete from Seedr after successful download
+                    if self.delete_after_download:
+                        try:
+                            await self._client.delete_folder(folder_id)
+                            logger.info(f"Deleted from Seedr: {folder_name}")
+                            await self._update_storage_info()
+                            await self._process_queue()
+                        except Exception as e:
+                            logger.warning(f"Failed to delete from Seedr: {e}")
+
+            except asyncio.CancelledError:
+                logger.info(f"QNAP download cancelled: {folder_name}")
+                # Cancel QNAP tasks
+                if torrent_hash in self._qnap_task_mapping:
+                    for task_id in self._qnap_task_mapping[torrent_hash].split(","):
+                        try:
+                            await self._qnap_client.remove_task(task_id)
+                        except Exception:
+                            pass
+                    self._qnap_task_mapping.pop(torrent_hash, None)
+                self._download_progress.pop(torrent_hash, None)
+                self._active_downloads.pop(torrent_hash, None)
+                raise
+            except Exception as e:
+                logger.error(f"Error in QNAP download for {folder_name}: {e}")
+                self._download_progress[torrent_hash] = 0.0
+                self._record_error(torrent_hash, str(e))
+
+    async def _download_folder_direct(self, torrent_hash: str, folder_id: str, folder_name: str, save_path: str):
+        """Download all files from a Seedr folder directly via HTTP."""
         async with self._download_lock:
             try:
                 with LogContext(torrent_hash=torrent_hash, torrent_name=folder_name):
@@ -959,6 +1205,9 @@ class SeedrClientWrapper:
                 if category:
                     self._category_mapping[torrent_hash] = category
                     self._instance_mapping[torrent_hash] = instance_id
+                    # Track name → hash for folder transition
+                    if name and name != "Unknown Torrent":
+                        self._name_to_hash_mapping[name] = torrent_hash
                     cat_path = os.path.join(self.download_path, category)
                     os.makedirs(cat_path, exist_ok=True)
 

@@ -13,6 +13,7 @@ def mock_seedr_client():
     with patch("seedr_sonarr.server.seedr_client") as mock:
         mock.get_torrents = AsyncMock(return_value=[])
         mock.test_connection = AsyncMock(return_value=(True, "Connected"))
+        mock.set_category_mapping = AsyncMock(return_value=None)
         mock._category_mapping = {}
         mock._queued_torrents = []
         mock._local_downloads = set()

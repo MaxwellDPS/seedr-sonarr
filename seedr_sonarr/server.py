@@ -48,6 +48,17 @@ class Settings(BaseSettings):
     auto_download: bool = True
     delete_after_download: bool = True
 
+    # QNAP Download Station settings (optional - if enabled, uses QNAP for local downloads)
+    qnap_enabled: bool = False
+    qnap_host: str = ""
+    qnap_port: int = 8080
+    qnap_username: str = ""
+    qnap_password: str = ""
+    qnap_use_https: bool = False
+    qnap_verify_ssl: bool = True
+    qnap_temp_folder: str = "Download"  # Temp folder on QNAP for in-progress downloads
+    qnap_dest_folder: str = ""  # Final destination folder on QNAP (e.g., "Multimedia/TV")
+
     # Persistence settings
     state_file: str = "seedr_state.db"
     persist_state: bool = True
@@ -80,6 +91,7 @@ seedr_client: Optional[SeedrClientWrapper] = None
 state_manager: Optional[StateManager] = None
 persistence_manager: Optional[PersistenceManager] = None
 activity_log_handler: Optional[ActivityLogHandler] = None
+qnap_client = None  # Optional QNAP Download Station client
 sessions: dict[str, datetime] = {}
 SESSION_TIMEOUT = timedelta(hours=24)
 SESSION_CLEANUP_INTERVAL = 300  # Clean up expired sessions every 5 minutes
@@ -107,7 +119,7 @@ async def _cleanup_expired_sessions():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global seedr_client, state_manager, persistence_manager, activity_log_handler, _session_cleanup_task
+    global seedr_client, state_manager, persistence_manager, activity_log_handler, qnap_client, _session_cleanup_task
 
     # Setup logging first
     activity_log_handler = setup_logging(
@@ -163,6 +175,29 @@ async def lifespan(app: FastAPI):
         reset_timeout=settings.circuit_reset_timeout,
     )
 
+    # Initialize QNAP Download Station client if enabled
+    if settings.qnap_enabled and settings.qnap_host:
+        try:
+            from .qnap_client import QnapDownloadStationClient
+
+            qnap_client = QnapDownloadStationClient(
+                host=settings.qnap_host,
+                port=settings.qnap_port,
+                username=settings.qnap_username,
+                password=settings.qnap_password,
+                use_https=settings.qnap_use_https,
+                verify_ssl=settings.qnap_verify_ssl,
+            )
+            success, message = await qnap_client.test_connection()
+            if success:
+                logger.info(f"QNAP Download Station connected: {message}")
+            else:
+                logger.error(f"QNAP Download Station connection failed: {message}")
+                qnap_client = None
+        except Exception as e:
+            logger.error(f"Failed to initialize QNAP client: {e}")
+            qnap_client = None
+
     # Initialize Seedr client
     seedr_client = SeedrClientWrapper(
         email=settings.seedr_email,
@@ -174,6 +209,9 @@ async def lifespan(app: FastAPI):
         state_manager=state_manager,
         retry_config=retry_config,
         circuit_config=circuit_config,
+        qnap_client=qnap_client,
+        qnap_temp_folder=settings.qnap_temp_folder,
+        qnap_dest_folder=settings.qnap_dest_folder,
     )
 
     try:
@@ -196,6 +234,8 @@ async def lifespan(app: FastAPI):
             pass
 
     # Shutdown
+    if qnap_client:
+        await qnap_client.close()
     if seedr_client:
         await seedr_client.close()
     if state_manager:
