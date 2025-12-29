@@ -680,6 +680,38 @@ class SeedrClientWrapper:
                         torrents.append(mapped_torrent)
                         self._torrents_cache[queue_hash] = mapped_torrent
 
+                # Add persisted completed torrents that are no longer in Seedr
+                # This ensures completed downloads still appear after Seedr deletion
+                if self._state_manager:
+                    seen_hashes = {t.hash for t in torrents}
+                    for persisted in await self._state_manager.get_torrents():
+                        if persisted.hash not in seen_hashes and persisted.phase == TorrentPhase.COMPLETED:
+                            # This torrent was completed and deleted from Seedr
+                            torrent = SeedrTorrent(
+                                id=persisted.seedr_id or "",
+                                hash=persisted.hash,
+                                name=persisted.name,
+                                size=persisted.size,
+                                progress=1.0,
+                                state=TorrentState.COMPLETED_LOCAL,
+                                download_speed=0,
+                                upload_speed=0,
+                                added_on=persisted.added_on,
+                                completion_on=persisted.added_on,
+                                save_path=persisted.save_path,
+                                content_path=persisted.content_path or "",
+                                category=persisted.category,
+                                instance_id=persisted.instance_id,
+                                downloaded=persisted.size,
+                                completed=persisted.size,
+                                local_progress=1.0,
+                                is_local=True,
+                                phase=TorrentPhase.COMPLETED,
+                            )
+                            torrents.append(torrent)
+                            self._torrents_cache[persisted.hash] = torrent
+                            logger.debug(f"Added persisted completed torrent: {persisted.name}")
+
                 return torrents
 
             except Exception as e:
@@ -944,9 +976,22 @@ class SeedrClientWrapper:
                     self._last_errors.pop(torrent_hash, None)
                     self._download_retry_after.pop(torrent_hash, None)
 
-                    # Persist local download
+                    # Persist local download and torrent info (needed to show after Seedr deletion)
                     if self._state_manager:
                         await self._state_manager.mark_local_download(torrent_hash)
+                        # Save full torrent info so it can be displayed after Seedr deletion
+                        category = self._category_mapping.get(torrent_hash, "")
+                        instance_id = self._instance_mapping.get(torrent_hash, "")
+                        await self._state_manager.save_completed_torrent(
+                            hash=torrent_hash,
+                            seedr_id=folder_id,
+                            name=folder_name,
+                            size=total_size,
+                            category=category,
+                            instance_id=instance_id,
+                            save_path=save_path,
+                            content_path=local_dest,
+                        )
 
                     # Delete from Seedr after handing off to QNAP
                     if self.delete_after_download:

@@ -636,6 +636,68 @@ class StateManager:
                     details="Downloaded to local storage",
                 )
 
+    async def save_completed_torrent(
+        self,
+        hash: str,
+        seedr_id: str,
+        name: str,
+        size: int,
+        category: str,
+        instance_id: str,
+        save_path: str,
+        content_path: str,
+    ) -> None:
+        """
+        Save completed torrent info to persistence.
+        This ensures the torrent can be displayed even after deletion from Seedr.
+        """
+        async with self._lock:
+            real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+
+            # Create or update torrent state in memory
+            torrent = TorrentState(
+                hash=real_hash,
+                seedr_id=seedr_id,
+                name=name,
+                size=size,
+                category=category,
+                instance_id=instance_id,
+                phase=TorrentPhase.COMPLETED,
+                seedr_progress=1.0,
+                local_progress=1.0,
+                added_on=int(datetime.now().timestamp()),
+                save_path=save_path,
+                content_path=content_path,
+            )
+            self._torrents[real_hash] = torrent
+
+            if self._persist_enabled:
+                from .persistence import PersistedTorrent
+                await self._persistence.save_torrent(PersistedTorrent(
+                    hash=real_hash,
+                    seedr_id=seedr_id,
+                    name=name,
+                    size=size,
+                    category=category,
+                    instance_id=instance_id,
+                    state=torrent.qbit_state,
+                    phase=TorrentPhase.COMPLETED.value,
+                    seedr_progress=1.0,
+                    local_progress=1.0,
+                    added_on=torrent.added_on,
+                    save_path=save_path,
+                    content_path=content_path,
+                ))
+                await self._persistence.log_activity(
+                    action="torrent_completed",
+                    torrent_hash=real_hash,
+                    torrent_name=name,
+                    category=category,
+                    details=f"Completed and persisted (content: {content_path})",
+                )
+
+            logger.info(f"Saved completed torrent: {name} (hash: {real_hash})")
+
     def is_local_download(self, hash: str) -> bool:
         """Check if a torrent is downloaded locally."""
         real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
