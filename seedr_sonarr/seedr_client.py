@@ -167,6 +167,7 @@ class SeedrClientWrapper:
         self._qnap_folder_progress: dict[str, dict] = {}  # folder_name -> {progress, speed, eta, status}
         self._qnap_last_query: float = 0  # Timestamp of last QNAP query
         self._qnap_query_interval: float = 5.0  # Query QNAP every 5 seconds
+        self._qnap_cleaned_folders: set[str] = set()  # Folders whose completed tasks have been removed
 
         self._client = None
         self._lock = asyncio.Lock()
@@ -789,8 +790,10 @@ class SeedrClientWrapper:
                         folder_tasks[folder_name] = []
                     folder_tasks[folder_name].append(task)
 
-            # Calculate aggregate progress per folder
+            # Calculate aggregate progress per folder and clean up completed tasks
             new_progress = {}
+            tasks_to_remove = []  # Collect completed task IDs to remove
+
             for folder_name, tasks_list in folder_tasks.items():
                 total_size = sum(t.size for t in tasks_list)
                 total_downloaded = sum(t.downloaded for t in tasks_list)
@@ -812,6 +815,10 @@ class SeedrClientWrapper:
                 statuses = [t.status.name for t in tasks_list]
                 if all(s == "COMPLETED" for s in statuses):
                     status = "completed"
+                    # Mark completed tasks for removal if not already cleaned
+                    if folder_name not in self._qnap_cleaned_folders:
+                        for task in tasks_list:
+                            tasks_to_remove.append((task.id, folder_name))
                 elif any(s == "ERROR" for s in statuses):
                     status = "error"
                 elif any(s == "DOWNLOADING" for s in statuses):
@@ -830,6 +837,31 @@ class SeedrClientWrapper:
                 }
 
             self._qnap_folder_progress = new_progress
+
+            # Remove completed tasks from QNAP Download Station
+            if tasks_to_remove:
+                folders_cleaned = set()
+                for task_id, folder_name in tasks_to_remove:
+                    try:
+                        success = await self._qnap_client.remove_task(task_id)
+                        if success:
+                            logger.info(f"Removed completed QNAP task {task_id} for {folder_name}")
+                            folders_cleaned.add(folder_name)
+                        else:
+                            logger.warning(f"Failed to remove QNAP task {task_id}")
+                    except Exception as e:
+                        logger.warning(f"Error removing QNAP task {task_id}: {e}")
+
+                # Mark folders as cleaned so we don't try to remove again
+                self._qnap_cleaned_folders.update(folders_cleaned)
+
+            # Clean up _qnap_cleaned_folders - remove entries for folders no longer in QNAP
+            # This prevents the set from growing indefinitely
+            current_folders = set(folder_tasks.keys())
+            stale_cleaned = self._qnap_cleaned_folders - current_folders
+            if stale_cleaned:
+                self._qnap_cleaned_folders -= stale_cleaned
+                logger.debug(f"Cleaned up {len(stale_cleaned)} stale folder entries from tracking")
 
         except Exception as e:
             logger.warning(f"Failed to query QNAP tasks: {e}")
