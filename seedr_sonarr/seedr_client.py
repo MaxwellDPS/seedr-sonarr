@@ -127,6 +127,22 @@ class SeedrTorrent:
             self.instance_id = extract_instance_id(self.category)
 
 
+def normalize_folder_name(name: str) -> str:
+    """
+    Normalize folder name for consistent lookups.
+    Seedr sometimes normalizes names (e.g., '+' -> space, special chars removed).
+    This ensures we can match names regardless of normalization.
+    """
+    if not name:
+        return ""
+    # Replace + with space (common Seedr normalization)
+    normalized = name.replace("+", " ")
+    # Collapse multiple spaces into one
+    while "  " in normalized:
+        normalized = normalized.replace("  ", " ")
+    return normalized.strip()
+
+
 class SeedrClientWrapper:
     """
     Wrapper around seedrcc that provides simplified interface for the proxy.
@@ -277,8 +293,9 @@ class SeedrClientWrapper:
                     self._category_mapping[torrent.hash] = torrent.category
                     self._instance_mapping[torrent.hash] = torrent.instance_id
                 # Always restore name → hash mapping for folder transitions (even without category)
+                # Use normalized name for consistent lookups
                 if torrent.name:
-                    self._name_to_hash_mapping[torrent.name] = torrent.hash
+                    self._name_to_hash_mapping[normalize_folder_name(torrent.name)] = torrent.hash
 
             # Restore queue
             for queued in await self._state_manager.get_queue():
@@ -316,9 +333,9 @@ class SeedrClientWrapper:
                 if pending.category:
                     self._category_mapping[pending.torrent_hash] = pending.category
                     self._instance_mapping[pending.torrent_hash] = pending.instance_id
-                # Restore name mapping
+                # Restore name mapping (normalized for consistent lookups)
                 if pending.folder_name:
-                    self._name_to_hash_mapping[pending.folder_name] = pending.torrent_hash
+                    self._name_to_hash_mapping[normalize_folder_name(pending.folder_name)] = pending.torrent_hash
 
             logger.info(
                 f"Restored state: {len(self._local_downloads)} local downloads, "
@@ -465,8 +482,9 @@ class SeedrClientWrapper:
 
                     # Track name → hash mapping for folder transition
                     # IMPORTANT: Always track this, even if no category - needed for hash transitions
+                    # Use normalized name for consistent lookups (Seedr may change + to spaces, etc.)
                     if transfer.name:
-                        self._name_to_hash_mapping[transfer.name] = torrent_hash
+                        self._name_to_hash_mapping[normalize_folder_name(transfer.name)] = torrent_hash
 
                     # Seedr progress maps to 0-50% of total progress
                     effective_progress = seedr_progress * 0.5
@@ -528,8 +546,10 @@ class SeedrClientWrapper:
                     instance_id = self._instance_mapping.get(torrent_hash, "")
 
                     # If no category found, try to look up by name (for hash transitions)
-                    if not category and folder.name in self._name_to_hash_mapping:
-                        original_hash = self._name_to_hash_mapping[folder.name]
+                    # Use normalized name for lookups (Seedr may change + to spaces, etc.)
+                    normalized_folder_name = normalize_folder_name(folder.name)
+                    if not category and normalized_folder_name in self._name_to_hash_mapping:
+                        original_hash = self._name_to_hash_mapping[normalized_folder_name]
                         category = self._category_mapping.get(original_hash, "")
                         instance_id = self._instance_mapping.get(original_hash, "")
                         if category:
@@ -537,7 +557,7 @@ class SeedrClientWrapper:
                             self._category_mapping[torrent_hash] = category
                             self._instance_mapping[torrent_hash] = instance_id
                             # Also update name mapping to point to new hash
-                            self._name_to_hash_mapping[folder.name] = torrent_hash
+                            self._name_to_hash_mapping[normalized_folder_name] = torrent_hash
                             # Persist the hash transition
                             if self._state_manager:
                                 await self._state_manager.add_hash_mapping(original_hash, torrent_hash)
@@ -676,8 +696,9 @@ class SeedrClientWrapper:
                     self._torrents_cache[torrent_hash] = torrent
 
                     # Start auto-download if enabled
-                    # Skip if: already local, already downloading, or QNAP is handling it
-                    should_download = self.auto_download and not is_local and not has_qnap_tasks and torrent_hash not in self._download_tasks
+                    # Skip if: already local, already downloading, QNAP is handling it, or pending QNAP completion
+                    is_pending_qnap = torrent_hash in self._qnap_pending_completion
+                    should_download = self.auto_download and not is_local and not has_qnap_tasks and not is_pending_qnap and torrent_hash not in self._download_tasks
                     if should_download:
                         self._start_download_task(torrent_hash, folder.id, folder.name, save_path)
                     elif self.auto_download and not is_local:
@@ -685,6 +706,8 @@ class SeedrClientWrapper:
                         reasons = []
                         if has_qnap_tasks:
                             reasons.append(f"QNAP has tasks (status={qnap_status})")
+                        if is_pending_qnap:
+                            reasons.append("pending QNAP completion")
                         if torrent_hash in self._download_tasks:
                             reasons.append("download task already running")
                         if reasons:
@@ -1086,8 +1109,10 @@ class SeedrClientWrapper:
                             self._category_mapping[torrent_hash] = category
 
                     # Try looking up by folder name -> hash mapping
-                    if not category and folder_name in self._name_to_hash_mapping:
-                        original_hash = self._name_to_hash_mapping[folder_name]
+                    # Use normalized name for lookups (Seedr may change + to spaces, etc.)
+                    normalized_name = normalize_folder_name(folder_name)
+                    if not category and normalized_name in self._name_to_hash_mapping:
+                        original_hash = self._name_to_hash_mapping[normalized_name]
                         original_category = self._category_mapping.get(original_hash, "")
                         if original_category:
                             category = original_category
@@ -1098,6 +1123,7 @@ class SeedrClientWrapper:
                         logger.warning(
                             f"No category found for {folder_name} (hash={torrent_hash}). "
                             f"Files will go to root downloads folder. "
+                            f"normalized_name='{normalized_name}', "
                             f"name_mappings={list(self._name_to_hash_mapping.keys())[:5]}..."
                         )
 
@@ -1635,8 +1661,9 @@ class SeedrClientWrapper:
                 name = getattr(result, 'name', name)
 
                 # Always track name → hash for folder transitions (even without category)
+                # Use normalized name for consistent lookups (Seedr may change + to spaces, etc.)
                 if name and name != "Unknown Torrent":
-                    self._name_to_hash_mapping[name] = torrent_hash
+                    self._name_to_hash_mapping[normalize_folder_name(name)] = torrent_hash
 
                 if category:
                     self._category_mapping[torrent_hash] = category
