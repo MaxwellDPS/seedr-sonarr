@@ -168,6 +168,7 @@ class SeedrClientWrapper:
         self._qnap_last_query: float = 0  # Timestamp of last QNAP query
         self._qnap_query_interval: float = 5.0  # Query QNAP every 5 seconds
         self._qnap_cleaned_folders: set[str] = set()  # Folders whose completed tasks have been removed
+        self._qnap_pending_completion: dict[str, dict] = {}  # torrent_hash -> info for persistence when QNAP completes
 
         self._client = None
         self._lock = asyncio.Lock()
@@ -550,6 +551,22 @@ class SeedrClientWrapper:
                         local_progress = 1.0
                         self._local_downloads.add(torrent_hash)
                         is_local = True
+
+                        # Persist completion if we have pending info
+                        if torrent_hash in self._qnap_pending_completion and self._state_manager:
+                            pending = self._qnap_pending_completion.pop(torrent_hash)
+                            logger.info(f"QNAP completed - persisting torrent: {pending['folder_name']}")
+                            await self._state_manager.mark_local_download(torrent_hash)
+                            await self._state_manager.save_completed_torrent(
+                                hash=torrent_hash,
+                                seedr_id=pending["folder_id"],
+                                name=pending["folder_name"],
+                                size=pending["total_size"],
+                                category=pending["category"],
+                                instance_id=pending["instance_id"],
+                                save_path=pending["save_path"],
+                                content_path=pending["content_path"],
+                            )
                     elif has_qnap_tasks:
                         # QNAP is actively downloading/waiting
                         state = TorrentState.DOWNLOADING_LOCAL
@@ -695,10 +712,79 @@ class SeedrClientWrapper:
                         torrents.append(mapped_torrent)
                         self._torrents_cache[queue_hash] = mapped_torrent
 
+                # Add pending QNAP downloads (deleted from Seedr but still downloading via QNAP)
+                seen_hashes = {t.hash for t in torrents}
+                for pending_hash, pending in self._qnap_pending_completion.items():
+                    if pending_hash not in seen_hashes:
+                        # Get QNAP progress for this folder
+                        qnap_info = self._get_qnap_progress(pending["folder_name"]) if self._qnap_client else {}
+                        qnap_progress = qnap_info.get("progress", 0.0)
+                        qnap_speed = qnap_info.get("speed", 0)
+                        qnap_status = qnap_info.get("status", "unknown")
+
+                        # Check if QNAP completed
+                        if qnap_status == "completed":
+                            state = TorrentState.COMPLETED_LOCAL
+                            local_progress = 1.0
+                            self._local_downloads.add(pending_hash)
+                            # Persist completion
+                            if self._state_manager:
+                                logger.info(f"QNAP completed (pending) - persisting: {pending['folder_name']}")
+                                await self._state_manager.mark_local_download(pending_hash)
+                                await self._state_manager.save_completed_torrent(
+                                    hash=pending_hash,
+                                    seedr_id=pending["folder_id"],
+                                    name=pending["folder_name"],
+                                    size=pending["total_size"],
+                                    category=pending["category"],
+                                    instance_id=pending["instance_id"],
+                                    save_path=pending["save_path"],
+                                    content_path=pending["content_path"],
+                                )
+                            # Remove from pending
+                            self._qnap_pending_completion.pop(pending_hash, None)
+                            phase = TorrentPhase.COMPLETED
+                        elif qnap_status in ("downloading", "waiting"):
+                            state = TorrentState.DOWNLOADING_LOCAL
+                            local_progress = qnap_progress
+                            phase = TorrentPhase.DOWNLOADING_TO_LOCAL
+                        else:
+                            state = TorrentState.DOWNLOADING_LOCAL
+                            local_progress = 0.5
+                            phase = TorrentPhase.DOWNLOADING_TO_LOCAL
+
+                        # Progress: 50% (Seedr done) + 50% * QNAP progress
+                        effective_progress = 0.5 + (0.5 * local_progress)
+
+                        torrent = SeedrTorrent(
+                            id=pending["folder_id"],
+                            hash=pending_hash,
+                            name=pending["folder_name"],
+                            size=pending["total_size"],
+                            progress=effective_progress,
+                            state=state,
+                            download_speed=qnap_speed,
+                            upload_speed=0,
+                            added_on=int(datetime.now().timestamp()),
+                            completion_on=int(datetime.now().timestamp()) if local_progress >= 1.0 else 0,
+                            save_path=pending["save_path"],
+                            content_path=pending["content_path"],
+                            category=pending["category"],
+                            instance_id=pending["instance_id"],
+                            downloaded=int(pending["total_size"] * effective_progress),
+                            completed=int(pending["total_size"] * local_progress),
+                            local_progress=local_progress,
+                            is_local=local_progress >= 1.0,
+                            phase=phase,
+                        )
+                        torrents.append(torrent)
+                        self._torrents_cache[pending_hash] = torrent
+                        seen_hashes.add(pending_hash)
+                        logger.debug(f"Added pending QNAP torrent: {pending['folder_name']} (status={qnap_status})")
+
                 # Add persisted completed torrents that are no longer in Seedr
                 # This ensures completed downloads still appear after Seedr deletion
                 if self._state_manager:
-                    seen_hashes = {t.hash for t in torrents}
                     for persisted in await self._state_manager.get_torrents():
                         if persisted.hash not in seen_hashes and persisted.phase == TorrentPhase.COMPLETED:
                             # This torrent was completed and deleted from Seedr
@@ -1032,9 +1118,9 @@ class SeedrClientWrapper:
                         # Still continue - the successful files will download
 
                     # Mark as handed off to QNAP - files will download in background
-                    # We consider this "complete" from our perspective since QNAP handles the rest
-                    self._download_progress[torrent_hash] = 1.0
-                    self._local_downloads.add(torrent_hash)
+                    # NOTE: Do NOT add to _local_downloads here - wait until QNAP reports completion
+                    # This ensures Sonarr sees the torrent as "downloading" until files are actually ready
+                    self._download_progress[torrent_hash] = 0.5  # 50% = handed off, waiting for QNAP
                     logger.info(f"Handed off to QNAP Download Station: {folder_name}")
 
                     # Clear errors
@@ -1042,22 +1128,23 @@ class SeedrClientWrapper:
                     self._last_errors.pop(torrent_hash, None)
                     self._download_retry_after.pop(torrent_hash, None)
 
-                    # Persist local download and torrent info (needed to show after Seedr deletion)
-                    if self._state_manager:
-                        await self._state_manager.mark_local_download(torrent_hash)
-                        # Save full torrent info so it can be displayed after Seedr deletion
-                        category = self._category_mapping.get(torrent_hash, "")
-                        instance_id = self._instance_mapping.get(torrent_hash, "")
-                        await self._state_manager.save_completed_torrent(
-                            hash=torrent_hash,
-                            seedr_id=folder_id,
-                            name=folder_name,
-                            size=total_size,
-                            category=category,
-                            instance_id=instance_id,
-                            save_path=save_path,
-                            content_path=local_dest,
-                        )
+                    # Store torrent info for when QNAP completes (needed for persistence after Seedr deletion)
+                    # We'll persist as completed when QNAP reports completion in get_torrents()
+                    pending_instance_id = self._instance_mapping.get(torrent_hash, "") or extract_instance_id(category)
+                    self._qnap_pending_completion[torrent_hash] = {
+                        "folder_id": folder_id,
+                        "folder_name": folder_name,
+                        "total_size": total_size,
+                        "category": category,
+                        "instance_id": pending_instance_id,
+                        "save_path": save_path,
+                        "content_path": local_dest,
+                    }
+                    logger.info(
+                        f"Stored pending completion info - "
+                        f"save_path: {save_path}, content_path: {local_dest}, "
+                        f"category: {category}, instance_id: {pending_instance_id}"
+                    )
 
                     # Delete from Seedr after handing off to QNAP
                     if self.delete_after_download:
