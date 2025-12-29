@@ -1156,13 +1156,27 @@ class SeedrClientWrapper:
                             logger.debug(f"Adding magnet link: {magnet_link[:80]}...")
                             return await self._client.add_torrent(magnet_link=magnet_link)
                         elif torrent_file:
-                            # Ensure torrent_file is bytes
+                            # seedrcc expects a file path, not bytes
+                            # Write bytes to a temp file and pass the path
                             tf = torrent_file
                             if isinstance(tf, str):
                                 logger.warning("torrent_file is string, encoding to bytes")
                                 tf = tf.encode('latin-1')
-                            logger.debug(f"Adding torrent file ({len(tf)} bytes)")
-                            return await self._client.add_torrent(torrent_file=tf)
+
+                            # Create temp file with .torrent extension
+                            with tempfile.NamedTemporaryFile(suffix='.torrent', delete=False) as tmp:
+                                tmp.write(tf)
+                                tmp_path = tmp.name
+
+                            try:
+                                logger.debug(f"Adding torrent file ({len(tf)} bytes) via temp file")
+                                return await self._client.add_torrent(torrent_file=tmp_path)
+                            finally:
+                                # Clean up temp file
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
                         else:
                             raise ValueError("Either magnet_link or torrent_file required")
 
@@ -1348,11 +1362,23 @@ class SeedrClientWrapper:
                         if queued.magnet_link:
                             result = await self._client.add_torrent(magnet_link=queued.magnet_link)
                         elif queued.torrent_file:
-                            # Ensure torrent_file is bytes
+                            # seedrcc expects a file path, not bytes
                             tf = queued.torrent_file
                             if isinstance(tf, str):
                                 tf = tf.encode('latin-1')
-                            result = await self._client.add_torrent(torrent_file=tf)
+
+                            # Write to temp file and pass path
+                            with tempfile.NamedTemporaryFile(suffix='.torrent', delete=False) as tmp:
+                                tmp.write(tf)
+                                tmp_path = tmp.name
+
+                            try:
+                                result = await self._client.add_torrent(torrent_file=tmp_path)
+                            finally:
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
                         else:
                             logger.error(f"Queued torrent has no magnet or file: {queued.id}")
                             continue
