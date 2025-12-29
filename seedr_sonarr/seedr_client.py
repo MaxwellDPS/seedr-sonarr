@@ -276,9 +276,9 @@ class SeedrClientWrapper:
                 if torrent.category:
                     self._category_mapping[torrent.hash] = torrent.category
                     self._instance_mapping[torrent.hash] = torrent.instance_id
-                    # Restore name → hash mapping for folder transitions
-                    if torrent.name:
-                        self._name_to_hash_mapping[torrent.name] = torrent.hash
+                # Always restore name → hash mapping for folder transitions (even without category)
+                if torrent.name:
+                    self._name_to_hash_mapping[torrent.name] = torrent.hash
 
             # Restore queue
             for queued in await self._state_manager.get_queue():
@@ -301,9 +301,29 @@ class SeedrClientWrapper:
                 except ValueError:
                     pass
 
+            # Restore QNAP pending downloads
+            for pending in await self._state_manager.get_qnap_pending():
+                self._qnap_pending_completion[pending.torrent_hash] = {
+                    "folder_id": pending.folder_id,
+                    "folder_name": pending.folder_name,
+                    "total_size": pending.total_size,
+                    "category": pending.category,
+                    "instance_id": pending.instance_id,
+                    "save_path": pending.save_path,
+                    "content_path": pending.content_path,
+                }
+                # Also restore category mapping
+                if pending.category:
+                    self._category_mapping[pending.torrent_hash] = pending.category
+                    self._instance_mapping[pending.torrent_hash] = pending.instance_id
+                # Restore name mapping
+                if pending.folder_name:
+                    self._name_to_hash_mapping[pending.folder_name] = pending.torrent_hash
+
             logger.info(
                 f"Restored state: {len(self._local_downloads)} local downloads, "
-                f"{len(self._torrent_queue)} queued torrents"
+                f"{len(self._torrent_queue)} queued torrents, "
+                f"{len(self._qnap_pending_completion)} QNAP pending"
             )
 
         except Exception as e:
@@ -444,7 +464,8 @@ class SeedrClientWrapper:
                     instance_id = self._instance_mapping.get(torrent_hash, extract_instance_id(category))
 
                     # Track name → hash mapping for folder transition
-                    if category and transfer.name:
+                    # IMPORTANT: Always track this, even if no category - needed for hash transitions
+                    if transfer.name:
                         self._name_to_hash_mapping[transfer.name] = torrent_hash
 
                     # Seedr progress maps to 0-50% of total progress
@@ -567,6 +588,8 @@ class SeedrClientWrapper:
                                 save_path=pending["save_path"],
                                 content_path=pending["content_path"],
                             )
+                            # Remove from pending persistence
+                            await self._state_manager.delete_qnap_pending(torrent_hash)
                     elif has_qnap_tasks:
                         # QNAP is actively downloading/waiting
                         state = TorrentState.DOWNLOADING_LOCAL
@@ -714,7 +737,8 @@ class SeedrClientWrapper:
 
                 # Add pending QNAP downloads (deleted from Seedr but still downloading via QNAP)
                 seen_hashes = {t.hash for t in torrents}
-                for pending_hash, pending in self._qnap_pending_completion.items():
+                pending_to_remove = []  # Track items to remove after iteration
+                for pending_hash, pending in list(self._qnap_pending_completion.items()):
                     if pending_hash not in seen_hashes:
                         # Get QNAP progress for this folder
                         qnap_info = self._get_qnap_progress(pending["folder_name"]) if self._qnap_client else {}
@@ -741,8 +765,10 @@ class SeedrClientWrapper:
                                     save_path=pending["save_path"],
                                     content_path=pending["content_path"],
                                 )
-                            # Remove from pending
-                            self._qnap_pending_completion.pop(pending_hash, None)
+                                # Remove from pending persistence
+                                await self._state_manager.delete_qnap_pending(pending_hash)
+                            # Mark for removal after iteration
+                            pending_to_remove.append(pending_hash)
                             phase = TorrentPhase.COMPLETED
                         elif qnap_status in ("downloading", "waiting"):
                             state = TorrentState.DOWNLOADING_LOCAL
@@ -781,6 +807,10 @@ class SeedrClientWrapper:
                         self._torrents_cache[pending_hash] = torrent
                         seen_hashes.add(pending_hash)
                         logger.debug(f"Added pending QNAP torrent: {pending['folder_name']} (status={qnap_status})")
+
+                # Remove completed pending items after iteration
+                for h in pending_to_remove:
+                    self._qnap_pending_completion.pop(h, None)
 
                 # Add persisted completed torrents that are no longer in Seedr
                 # This ensures completed downloads still appear after Seedr deletion
@@ -1003,6 +1033,14 @@ class SeedrClientWrapper:
                     # The local /downloads path maps to plex/downloads on QNAP via the bind mount.
                     category = self._category_mapping.get(torrent_hash, "")
 
+                    # Log the lookup attempt for debugging
+                    logger.debug(
+                        f"Category lookup for {folder_name}: "
+                        f"torrent_hash={torrent_hash}, "
+                        f"category_mapping={category}, "
+                        f"save_path={save_path}"
+                    )
+
                     # If category not in mapping, try to extract from save_path
                     # save_path is like /downloads/tv-sonarr, so strip download_path prefix
                     if not category and save_path and save_path != self.download_path:
@@ -1013,6 +1051,31 @@ class SeedrClientWrapper:
                             logger.info(f"Extracted category from save_path: {category}")
                             # Store it for future lookups
                             self._category_mapping[torrent_hash] = category
+
+                    # If still no category, try looking up via torrent cache
+                    # This handles cases where the mapping was lost but cache has it
+                    if not category and torrent_hash in self._torrents_cache:
+                        cached = self._torrents_cache[torrent_hash]
+                        if cached.category:
+                            category = cached.category
+                            logger.info(f"Found category from cache: {category}")
+                            self._category_mapping[torrent_hash] = category
+
+                    # Try looking up by folder name -> hash mapping
+                    if not category and folder_name in self._name_to_hash_mapping:
+                        original_hash = self._name_to_hash_mapping[folder_name]
+                        original_category = self._category_mapping.get(original_hash, "")
+                        if original_category:
+                            category = original_category
+                            logger.info(f"Found category via name mapping: {folder_name} -> {original_hash} -> {category}")
+                            self._category_mapping[torrent_hash] = category
+
+                    if not category:
+                        logger.warning(
+                            f"No category found for {folder_name} (hash={torrent_hash}). "
+                            f"Files will go to root downloads folder. "
+                            f"name_mappings={list(self._name_to_hash_mapping.keys())[:5]}..."
+                        )
 
                     # Build local path and create directory
                     if category:
@@ -1140,6 +1203,20 @@ class SeedrClientWrapper:
                         "save_path": save_path,
                         "content_path": local_dest,
                     }
+
+                    # Persist to database so we can recover on restart
+                    if self._state_manager:
+                        await self._state_manager.save_qnap_pending(
+                            torrent_hash=torrent_hash,
+                            folder_id=folder_id,
+                            folder_name=folder_name,
+                            total_size=total_size,
+                            category=category,
+                            instance_id=pending_instance_id,
+                            save_path=save_path,
+                            content_path=local_dest,
+                        )
+
                     logger.info(
                         f"Stored pending completion info - "
                         f"save_path: {save_path}, content_path: {local_dest}, "
@@ -1147,7 +1224,8 @@ class SeedrClientWrapper:
                     )
 
                     # Delete from Seedr after handing off to QNAP
-                    if self.delete_after_download:
+                    # Only delete if ALL files were successfully added to QNAP
+                    if self.delete_after_download and not failed_files:
                         try:
                             await self._client.delete_folder(folder_id)
                             logger.info(f"Deleted from Seedr: {folder_name}")
@@ -1155,6 +1233,8 @@ class SeedrClientWrapper:
                             await self._process_queue()
                         except Exception as e:
                             logger.warning(f"Failed to delete from Seedr: {e}")
+                    elif failed_files:
+                        logger.warning(f"Not deleting {folder_name} from Seedr due to {len(failed_files)} failed file(s)")
 
             except asyncio.CancelledError:
                 logger.info(f"QNAP download cancelled: {folder_name}")
@@ -1417,6 +1497,13 @@ class SeedrClientWrapper:
         if not self._client:
             await self.initialize()
 
+        # Log incoming request for debugging category issues
+        logger.info(
+            f"add_torrent called: category='{category}', "
+            f"has_magnet={magnet_link is not None}, "
+            f"has_file={torrent_file is not None}"
+        )
+
         instance_id = extract_instance_id(category)
 
         # Check circuit breaker
@@ -1528,12 +1615,13 @@ class SeedrClientWrapper:
 
                 name = getattr(result, 'name', name)
 
+                # Always track name → hash for folder transitions (even without category)
+                if name and name != "Unknown Torrent":
+                    self._name_to_hash_mapping[name] = torrent_hash
+
                 if category:
                     self._category_mapping[torrent_hash] = category
                     self._instance_mapping[torrent_hash] = instance_id
-                    # Track name → hash for folder transition
-                    if name and name != "Unknown Torrent":
-                        self._name_to_hash_mapping[name] = torrent_hash
                     cat_path = os.path.join(self.download_path, category)
                     os.makedirs(cat_path, exist_ok=True)
                     try:
@@ -1850,6 +1938,7 @@ class SeedrClientWrapper:
                 self._local_downloads.discard(torrent_hash_to_delete)
                 self._error_counts.pop(torrent_hash_to_delete, None)
                 self._last_errors.pop(torrent_hash_to_delete, None)
+                self._qnap_pending_completion.pop(torrent_hash_to_delete, None)
 
                 if torrent_hash in self._hash_mapping:
                     del self._hash_mapping[torrent_hash]
@@ -1862,6 +1951,7 @@ class SeedrClientWrapper:
                 # Update state manager
                 if self._state_manager:
                     await self._state_manager.delete_torrent(torrent_hash_to_delete)
+                    await self._state_manager.delete_qnap_pending(torrent_hash_to_delete)
 
                 logger.info(f"Deleted torrent: {torrent.name}")
                 return True

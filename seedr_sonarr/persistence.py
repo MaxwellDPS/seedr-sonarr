@@ -78,6 +78,24 @@ class ActivityLogEntry:
     level: str = "INFO"
 
 
+@dataclass
+class PersistedQnapPending:
+    """QNAP pending download for persistence."""
+    torrent_hash: str
+    folder_id: str
+    folder_name: str
+    total_size: int
+    category: str
+    instance_id: str
+    save_path: str
+    content_path: str
+    created_at: float = 0.0
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now().timestamp()
+
+
 # SQL Schema
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS torrents (
@@ -138,6 +156,18 @@ CREATE TABLE IF NOT EXISTS activity_log (
     action TEXT NOT NULL,
     details TEXT,
     level TEXT DEFAULT 'INFO'
+);
+
+CREATE TABLE IF NOT EXISTS qnap_pending (
+    torrent_hash TEXT PRIMARY KEY,
+    folder_id TEXT NOT NULL,
+    folder_name TEXT NOT NULL,
+    total_size INTEGER NOT NULL,
+    category TEXT DEFAULT '',
+    instance_id TEXT DEFAULT '',
+    save_path TEXT NOT NULL,
+    content_path TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);
@@ -497,6 +527,61 @@ class PersistenceManager:
             await db.commit()
 
     # -------------------------------------------------------------------------
+    # QNAP Pending Operations
+    # -------------------------------------------------------------------------
+
+    async def save_qnap_pending(self, pending: "PersistedQnapPending") -> None:
+        """Save a QNAP pending download."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO qnap_pending
+                (torrent_hash, folder_id, folder_name, total_size, category,
+                 instance_id, save_path, content_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pending.torrent_hash, pending.folder_id, pending.folder_name,
+                pending.total_size, pending.category, pending.instance_id,
+                pending.save_path, pending.content_path, pending.created_at
+            ))
+            await db.commit()
+
+    async def get_qnap_pending(self) -> List["PersistedQnapPending"]:
+        """Get all QNAP pending downloads."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM qnap_pending") as cursor:
+                rows = await cursor.fetchall()
+                return [PersistedQnapPending(
+                    torrent_hash=row["torrent_hash"],
+                    folder_id=row["folder_id"],
+                    folder_name=row["folder_name"],
+                    total_size=row["total_size"],
+                    category=row["category"],
+                    instance_id=row["instance_id"],
+                    save_path=row["save_path"],
+                    content_path=row["content_path"],
+                    created_at=row["created_at"],
+                ) for row in rows]
+
+    async def delete_qnap_pending(self, torrent_hash: str) -> None:
+        """Delete a QNAP pending download."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM qnap_pending WHERE torrent_hash = ?", (torrent_hash,)
+            )
+            await db.commit()
+
+    async def clear_qnap_pending(self) -> int:
+        """Clear all QNAP pending downloads. Returns count deleted."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT COUNT(*) FROM qnap_pending") as cursor:
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
+            await db.execute("DELETE FROM qnap_pending")
+            await db.commit()
+            return count
+
+    # -------------------------------------------------------------------------
     # Activity Log Operations
     # -------------------------------------------------------------------------
 
@@ -600,7 +685,7 @@ class PersistenceManager:
             stats = {}
 
             for table in ["torrents", "queued_torrents", "categories",
-                         "hash_mappings", "local_downloads", "activity_log"]:
+                         "hash_mappings", "local_downloads", "qnap_pending", "activity_log"]:
                 async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
                     row = await cursor.fetchone()
                     stats[table] = row[0] if row else 0

@@ -17,6 +17,7 @@ from .persistence import (
     PersistedTorrent,
     PersistedQueuedTorrent,
     PersistedCategory,
+    PersistedQnapPending,
 )
 
 logger = logging.getLogger(__name__)
@@ -711,6 +712,45 @@ class StateManager:
 
             if self._persist_enabled:
                 await self._persistence.delete_local_download(real_hash)
+
+    # -------------------------------------------------------------------------
+    # QNAP Pending Operations
+    # -------------------------------------------------------------------------
+
+    async def save_qnap_pending(
+        self,
+        torrent_hash: str,
+        folder_id: str,
+        folder_name: str,
+        total_size: int,
+        category: str,
+        instance_id: str,
+        save_path: str,
+        content_path: str,
+    ) -> None:
+        """Save a QNAP pending download for persistence across restarts."""
+        if self._persist_enabled:
+            await self._persistence.save_qnap_pending(PersistedQnapPending(
+                torrent_hash=torrent_hash,
+                folder_id=folder_id,
+                folder_name=folder_name,
+                total_size=total_size,
+                category=category,
+                instance_id=instance_id,
+                save_path=save_path,
+                content_path=content_path,
+            ))
+
+    async def get_qnap_pending(self) -> List[PersistedQnapPending]:
+        """Get all QNAP pending downloads."""
+        if not self._persist_enabled:
+            return []
+        return await self._persistence.get_qnap_pending()
+
+    async def delete_qnap_pending(self, torrent_hash: str) -> None:
+        """Delete a QNAP pending download."""
+        if self._persist_enabled:
+            await self._persistence.delete_qnap_pending(torrent_hash)
 
     # -------------------------------------------------------------------------
     # Activity Log Operations
