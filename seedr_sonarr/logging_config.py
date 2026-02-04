@@ -9,7 +9,7 @@ import logging.handlers
 import sys
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import threading
@@ -85,7 +85,7 @@ class JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON."""
         log_obj = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -206,7 +206,7 @@ class ActivityLogHandler(logging.Handler):
         """Store log entry in buffer."""
         try:
             entry = ActivityLogEntry(
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 level=record.levelname,
                 logger=record.name,
                 message=record.getMessage(),

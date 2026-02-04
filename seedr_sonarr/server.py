@@ -15,7 +15,7 @@ import secrets
 from fastapi import FastAPI, Form, HTTPException, Request, Response, UploadFile, File
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .seedr_client import SeedrClientWrapper, TorrentState
 from .persistence import PersistenceManager
@@ -84,9 +84,10 @@ class Settings(BaseSettings):
     log_backup_count: int = 5
     activity_log_size: int = 1000
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 # Global instances

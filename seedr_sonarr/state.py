@@ -694,7 +694,6 @@ class StateManager:
             self._torrents[real_hash] = torrent
 
             if self._persist_enabled:
-                from .persistence import PersistedTorrent
                 await self._persistence.save_torrent(PersistedTorrent(
                     hash=real_hash,
                     seedr_id=seedr_id,

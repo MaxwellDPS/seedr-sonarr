@@ -8,7 +8,7 @@ import pytest
 import sys
 import time
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
 from seedr_sonarr.logging_config import (
@@ -369,7 +369,7 @@ class TestActivityLogHandler:
         )
         handler.emit(old_record)
 
-        since_time = datetime.utcnow().isoformat() + "Z"
+        since_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         time.sleep(0.01)  # Ensure time difference
 
         new_record = logging.LogRecord(
