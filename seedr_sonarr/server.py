@@ -1080,16 +1080,28 @@ async def torrents_tags(request: Request):
     """Get all tags."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-    return JSONResponse([])
+    tags = await state_manager.get_tags()
+    return JSONResponse(tags)
 
 
 @app.post("/api/v2/torrents/addTags")
 async def torrents_add_tags(
     request: Request, hashes: str = Form(...), tags: str = Form("")
 ):
-    """Add tags - Not fully implemented."""
+    """Add tags to torrents."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not tags:
+        return PlainTextResponse("Ok.")
+
+    hash_list = [h.strip() for h in hashes.split("|") if h.strip()]
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    if hash_list and tag_list:
+        await state_manager.add_torrent_tags(hash_list, tag_list)
+        logger.info(f"Added tags {tag_list} to torrents {hash_list}")
+
     return PlainTextResponse("Ok.")
 
 
@@ -1097,25 +1109,50 @@ async def torrents_add_tags(
 async def torrents_remove_tags(
     request: Request, hashes: str = Form(...), tags: str = Form("")
 ):
-    """Remove tags - Not fully implemented."""
+    """Remove tags from torrents."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not tags:
+        return PlainTextResponse("Ok.")
+
+    hash_list = [h.strip() for h in hashes.split("|") if h.strip()]
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    if hash_list and tag_list:
+        await state_manager.remove_torrent_tags(hash_list, tag_list)
+        logger.info(f"Removed tags {tag_list} from torrents {hash_list}")
+
     return PlainTextResponse("Ok.")
 
 
 @app.post("/api/v2/torrents/createTags")
 async def torrents_create_tags(request: Request, tags: str = Form(...)):
-    """Create tags - Not fully implemented."""
+    """Create new tags."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    for tag in tag_list:
+        await state_manager.create_tag(tag)
+        logger.info(f"Created tag: {tag}")
+
     return PlainTextResponse("Ok.")
 
 
 @app.post("/api/v2/torrents/deleteTags")
 async def torrents_delete_tags(request: Request, tags: str = Form(...)):
-    """Delete tags - Not fully implemented."""
+    """Delete tags."""
     if not validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    for tag in tag_list:
+        if await state_manager.delete_tag(tag):
+            logger.info(f"Deleted tag: {tag}")
+
     return PlainTextResponse("Ok.")
 
 

@@ -146,6 +146,8 @@ class StateManager:
         self._categories: Dict[str, CategoryState] = {}
         self._hash_mappings: Dict[str, str] = {}  # queue_hash -> real_hash
         self._local_downloads: Set[str] = set()
+        self._tags: Set[str] = set()  # Set of all tag names
+        self._torrent_tags: Dict[str, Set[str]] = {}  # torrent_hash -> set of tags
 
         # Activity callbacks
         self._on_phase_change: List[Callable[[str, TorrentPhase, TorrentPhase], Awaitable]] = []
@@ -229,6 +231,17 @@ class StateManager:
             self._local_downloads = await self._persistence.get_local_downloads()
             logger.info(f"Loaded {len(self._local_downloads)} local downloads from persistence")
 
+            # Load tags
+            self._tags = set(await self._persistence.get_tags())
+            logger.info(f"Loaded {len(self._tags)} tags from persistence")
+
+            # Load torrent tags
+            for torrent_hash in self._torrents.keys():
+                tags = await self._persistence.get_torrent_tags(torrent_hash)
+                if tags:
+                    self._torrent_tags[torrent_hash] = set(tags)
+            logger.info(f"Loaded tags for {len(self._torrent_tags)} torrents from persistence")
+
         except Exception as e:
             logger.error(f"Error loading state from persistence: {e}")
 
@@ -299,13 +312,15 @@ class StateManager:
 
     async def get_torrent(self, hash: str) -> Optional[TorrentState]:
         """Get a torrent by hash."""
-        # Check hash mapping
-        real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
-        return self._torrents.get(real_hash)
+        async with self._lock:
+            # Check hash mapping
+            real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+            return self._torrents.get(real_hash)
 
     async def get_torrents(self) -> List[TorrentState]:
         """Get all torrents."""
-        return list(self._torrents.values())
+        async with self._lock:
+            return list(self._torrents.values())
 
     async def delete_torrent(self, hash: str) -> bool:
         """Delete a torrent."""
@@ -398,23 +413,24 @@ class StateManager:
         download_speed: int = None,
     ) -> None:
         """Update torrent progress efficiently."""
-        real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
-        torrent = self._torrents.get(real_hash)
+        async with self._lock:
+            real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+            torrent = self._torrents.get(real_hash)
 
-        if not torrent:
-            return
+            if not torrent:
+                return
 
-        if seedr_progress is not None:
-            torrent.seedr_progress = seedr_progress
-        if local_progress is not None:
-            torrent.local_progress = local_progress
-        if download_speed is not None:
-            torrent.download_speed = download_speed
+            if seedr_progress is not None:
+                torrent.seedr_progress = seedr_progress
+            if local_progress is not None:
+                torrent.local_progress = local_progress
+            if download_speed is not None:
+                torrent.download_speed = download_speed
 
-        if self._persist_enabled:
-            await self._persistence.update_torrent_progress(
-                real_hash, seedr_progress, local_progress
-            )
+            if self._persist_enabled:
+                await self._persistence.update_torrent_progress(
+                    real_hash, seedr_progress, local_progress
+                )
 
     async def record_error(self, hash: str, error: str) -> None:
         """Record an error for a torrent."""
@@ -500,7 +516,8 @@ class StateManager:
 
     async def get_queue(self) -> List[QueuedTorrentState]:
         """Get all queued torrents."""
-        return list(self._queue)
+        async with self._lock:
+            return list(self._queue)
 
     async def pop_queue(self) -> Optional[QueuedTorrentState]:
         """Pop the first item from the queue."""
@@ -517,9 +534,10 @@ class StateManager:
 
     async def peek_queue(self) -> Optional[QueuedTorrentState]:
         """Peek at the first item in the queue without removing it."""
-        if not self._queue:
-            return None
-        return self._queue[0]
+        async with self._lock:
+            if not self._queue:
+                return None
+            return self._queue[0]
 
     async def remove_from_queue(self, id: str) -> bool:
         """Remove a specific item from the queue."""
@@ -572,11 +590,13 @@ class StateManager:
 
     async def get_category(self, name: str) -> Optional[CategoryState]:
         """Get a category by name."""
-        return self._categories.get(name)
+        async with self._lock:
+            return self._categories.get(name)
 
     async def get_categories(self) -> Dict[str, CategoryState]:
         """Get all categories."""
-        return dict(self._categories)
+        async with self._lock:
+            return dict(self._categories)
 
     async def delete_category(self, name: str) -> bool:
         """Delete a category."""
@@ -605,9 +625,10 @@ class StateManager:
                     queue_hash.upper(), real_hash.upper()
                 )
 
-    def resolve_hash(self, hash: str) -> str:
+    async def resolve_hash(self, hash: str) -> str:
         """Resolve a hash (queue hash -> real hash or same)."""
-        return self._hash_mappings.get(hash.upper(), hash.upper())
+        async with self._lock:
+            return self._hash_mappings.get(hash.upper(), hash.upper())
 
     async def delete_hash_mapping(self, queue_hash: str) -> None:
         """Delete a hash mapping."""
@@ -699,10 +720,11 @@ class StateManager:
 
             logger.info(f"Saved completed torrent: {name} (hash: {real_hash})")
 
-    def is_local_download(self, hash: str) -> bool:
+    async def is_local_download(self, hash: str) -> bool:
         """Check if a torrent is downloaded locally."""
-        real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
-        return real_hash in self._local_downloads
+        async with self._lock:
+            real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+            return real_hash in self._local_downloads
 
     async def remove_local_download(self, hash: str) -> None:
         """Remove a torrent from local downloads."""
@@ -809,33 +831,111 @@ class StateManager:
 
     async def get_stats(self) -> Dict:
         """Get state statistics."""
-        stats = {
-            "torrents": len(self._torrents),
-            "queued": len(self._queue),
-            "categories": len(self._categories),
-            "hash_mappings": len(self._hash_mappings),
-            "local_downloads": len(self._local_downloads),
-        }
+        async with self._lock:
+            stats = {
+                "torrents": len(self._torrents),
+                "queued": len(self._queue),
+                "categories": len(self._categories),
+                "hash_mappings": len(self._hash_mappings),
+                "local_downloads": len(self._local_downloads),
+            }
+
+            # Count by phase
+            phases = {}
+            for torrent in self._torrents.values():
+                phase = torrent.phase.value
+                phases[phase] = phases.get(phase, 0) + 1
+            stats["by_phase"] = phases
+
+            # Count by instance
+            instances = {}
+            for torrent in self._torrents.values():
+                instance = torrent.instance_id or "default"
+                instances[instance] = instances.get(instance, 0) + 1
+            stats["by_instance"] = instances
 
         if self._persist_enabled:
             db_stats = await self._persistence.get_stats()
             stats["persistence"] = db_stats
 
-        # Count by phase
-        phases = {}
-        for torrent in self._torrents.values():
-            phase = torrent.phase.value
-            phases[phase] = phases.get(phase, 0) + 1
-        stats["by_phase"] = phases
-
-        # Count by instance
-        instances = {}
-        for torrent in self._torrents.values():
-            instance = torrent.instance_id or "default"
-            instances[instance] = instances.get(instance, 0) + 1
-        stats["by_instance"] = instances
-
         return stats
+
+    # -------------------------------------------------------------------------
+    # Tag Operations
+    # -------------------------------------------------------------------------
+
+    async def create_tag(self, name: str) -> None:
+        """Create a new tag."""
+        async with self._lock:
+            self._tags.add(name)
+
+            if self._persist_enabled:
+                await self._persistence.save_tag(name)
+
+    async def get_tags(self) -> List[str]:
+        """Get all tags."""
+        async with self._lock:
+            return sorted(list(self._tags))
+
+    async def delete_tag(self, name: str) -> bool:
+        """Delete a tag and remove it from all torrents."""
+        async with self._lock:
+            if name not in self._tags:
+                return False
+
+            self._tags.discard(name)
+
+            # Remove tag from all torrents
+            for torrent_hash in list(self._torrent_tags.keys()):
+                if name in self._torrent_tags[torrent_hash]:
+                    self._torrent_tags[torrent_hash].discard(name)
+                    if not self._torrent_tags[torrent_hash]:
+                        del self._torrent_tags[torrent_hash]
+
+            if self._persist_enabled:
+                await self._persistence.delete_tag(name)
+
+            return True
+
+    async def add_torrent_tags(self, hashes: List[str], tags: List[str]) -> None:
+        """Add tags to torrents."""
+        async with self._lock:
+            for hash in hashes:
+                real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+
+                if real_hash not in self._torrent_tags:
+                    self._torrent_tags[real_hash] = set()
+
+                for tag in tags:
+                    self._tags.add(tag)
+                    self._torrent_tags[real_hash].add(tag)
+
+                    if self._persist_enabled:
+                        await self._persistence.add_torrent_tag(real_hash, tag)
+
+    async def remove_torrent_tags(self, hashes: List[str], tags: List[str]) -> None:
+        """Remove tags from torrents."""
+        async with self._lock:
+            for hash in hashes:
+                real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+
+                if real_hash in self._torrent_tags:
+                    for tag in tags:
+                        self._torrent_tags[real_hash].discard(tag)
+
+                        if self._persist_enabled:
+                            await self._persistence.remove_torrent_tag(real_hash, tag)
+
+                    # Clean up empty sets
+                    if not self._torrent_tags[real_hash]:
+                        del self._torrent_tags[real_hash]
+
+    async def get_torrent_tags(self, hash: str) -> List[str]:
+        """Get tags for a specific torrent."""
+        async with self._lock:
+            real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
+            tags = self._torrent_tags.get(real_hash, set())
+            return sorted(list(tags))
 
 
 def extract_instance_id(category: str) -> str:

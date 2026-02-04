@@ -590,20 +590,20 @@ class TestStateManagerHashMappings:
     async def test_add_hash_mapping(self, manager):
         """Test adding hash mapping."""
         await manager.add_hash_mapping("QUEUE123", "REAL456")
-        resolved = manager.resolve_hash("QUEUE123")
+        resolved = await manager.resolve_hash("QUEUE123")
         assert resolved == "REAL456"
 
     @pytest.mark.asyncio
     async def test_resolve_unmapped_hash(self, manager):
         """Test resolving unmapped hash returns same hash."""
-        resolved = manager.resolve_hash("ABC123")
+        resolved = await manager.resolve_hash("ABC123")
         assert resolved == "ABC123"
 
     @pytest.mark.asyncio
     async def test_resolve_hash_case_insensitive(self, manager):
         """Test hash resolution is case insensitive."""
         await manager.add_hash_mapping("queue123", "real456")
-        resolved = manager.resolve_hash("QUEUE123")
+        resolved = await manager.resolve_hash("QUEUE123")
         assert resolved == "REAL456"
 
     @pytest.mark.asyncio
@@ -611,7 +611,7 @@ class TestStateManagerHashMappings:
         """Test deleting hash mapping."""
         await manager.add_hash_mapping("QUEUE123", "REAL456")
         await manager.delete_hash_mapping("QUEUE123")
-        resolved = manager.resolve_hash("QUEUE123")
+        resolved = await manager.resolve_hash("QUEUE123")
         assert resolved == "QUEUE123"
 
     @pytest.mark.asyncio
@@ -653,19 +653,19 @@ class TestStateManagerLocalDownloads:
     async def test_mark_local_download(self, manager):
         """Test marking a torrent as locally downloaded."""
         await manager.mark_local_download("ABC123")
-        assert manager.is_local_download("ABC123") is True
+        assert await manager.is_local_download("ABC123") is True
 
     @pytest.mark.asyncio
     async def test_is_local_download_false(self, manager):
         """Test checking unmarked torrent."""
-        assert manager.is_local_download("ABC123") is False
+        assert await manager.is_local_download("ABC123") is False
 
     @pytest.mark.asyncio
     async def test_remove_local_download(self, manager):
         """Test removing local download mark."""
         await manager.mark_local_download("ABC123")
         await manager.remove_local_download("ABC123")
-        assert manager.is_local_download("ABC123") is False
+        assert await manager.is_local_download("ABC123") is False
 
     @pytest.mark.asyncio
     async def test_local_download_via_mapping(self, manager):
@@ -673,8 +673,8 @@ class TestStateManagerLocalDownloads:
         await manager.add_hash_mapping("QUEUE123", "REAL456")
         await manager.mark_local_download("QUEUE123")
 
-        assert manager.is_local_download("REAL456") is True
-        assert manager.is_local_download("QUEUE123") is True
+        assert await manager.is_local_download("REAL456") is True
+        assert await manager.is_local_download("QUEUE123") is True
 
 
 class TestStateManagerStats:

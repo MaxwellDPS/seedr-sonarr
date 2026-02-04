@@ -96,6 +96,17 @@ class PersistedQnapPending:
             self.created_at = datetime.now().timestamp()
 
 
+@dataclass
+class PersistedTag:
+    """Tag for persistence."""
+    name: str
+    created_at: float = 0.0
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now().timestamp()
+
+
 # SQL Schema
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS torrents (
@@ -170,7 +181,20 @@ CREATE TABLE IF NOT EXISTS qnap_pending (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tags (
+    name TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS torrent_tags (
+    torrent_hash TEXT NOT NULL,
+    tag_name TEXT NOT NULL,
+    PRIMARY KEY (torrent_hash, tag_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_torrent_tags_hash ON torrent_tags(torrent_hash);
+CREATE INDEX IF NOT EXISTS idx_torrent_tags_name ON torrent_tags(tag_name);
 CREATE INDEX IF NOT EXISTS idx_torrents_instance ON torrents(instance_id);
 CREATE INDEX IF NOT EXISTS idx_categories_instance ON categories(instance_id);
 CREATE INDEX IF NOT EXISTS idx_torrents_state ON torrents(state);
@@ -676,6 +700,94 @@ class PersistenceManager:
             return to_delete
 
     # -------------------------------------------------------------------------
+    # Tag Operations
+    # -------------------------------------------------------------------------
+
+    async def save_tag(self, name: str) -> None:
+        """Create or update a tag."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO tags (name, created_at) VALUES (?, ?)",
+                (name, datetime.now().timestamp())
+            )
+            await db.commit()
+            logger.debug(f"Saved tag: {name}")
+
+    async def get_tags(self) -> List[str]:
+        """Get all tags."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT name FROM tags ORDER BY name") as cursor:
+                rows = await cursor.fetchall()
+                return [row["name"] for row in rows]
+
+    async def delete_tag(self, name: str) -> None:
+        """Delete a tag and all its associations."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM torrent_tags WHERE tag_name = ?", (name,))
+            await db.execute("DELETE FROM tags WHERE name = ?", (name,))
+            await db.commit()
+            logger.debug(f"Deleted tag: {name}")
+
+    async def add_torrent_tag(self, torrent_hash: str, tag_name: str) -> None:
+        """Add a tag to a torrent."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Ensure tag exists
+            await db.execute(
+                "INSERT OR IGNORE INTO tags (name, created_at) VALUES (?, ?)",
+                (tag_name, datetime.now().timestamp())
+            )
+            # Add association
+            await db.execute(
+                "INSERT OR IGNORE INTO torrent_tags (torrent_hash, tag_name) VALUES (?, ?)",
+                (torrent_hash.upper(), tag_name)
+            )
+            await db.commit()
+            logger.debug(f"Added tag {tag_name} to torrent {torrent_hash}")
+
+    async def remove_torrent_tag(self, torrent_hash: str, tag_name: str) -> None:
+        """Remove a tag from a torrent."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM torrent_tags WHERE torrent_hash = ? AND tag_name = ?",
+                (torrent_hash.upper(), tag_name)
+            )
+            await db.commit()
+            logger.debug(f"Removed tag {tag_name} from torrent {torrent_hash}")
+
+    async def get_torrent_tags(self, torrent_hash: str) -> List[str]:
+        """Get all tags for a torrent."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT tag_name FROM torrent_tags WHERE torrent_hash = ? ORDER BY tag_name",
+                (torrent_hash.upper(),)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [row["tag_name"] for row in rows]
+
+    async def get_torrents_by_tag(self, tag_name: str) -> List[str]:
+        """Get all torrent hashes that have a specific tag."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT torrent_hash FROM torrent_tags WHERE tag_name = ?",
+                (tag_name,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [row["torrent_hash"] for row in rows]
+
+    async def clear_torrent_tags(self, torrent_hash: str) -> None:
+        """Remove all tags from a torrent."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM torrent_tags WHERE torrent_hash = ?",
+                (torrent_hash.upper(),)
+            )
+            await db.commit()
+            logger.debug(f"Cleared all tags from torrent {torrent_hash}")
+
+    # -------------------------------------------------------------------------
     # Utility Operations
     # -------------------------------------------------------------------------
 
@@ -685,7 +797,8 @@ class PersistenceManager:
             stats = {}
 
             for table in ["torrents", "queued_torrents", "categories",
-                         "hash_mappings", "local_downloads", "qnap_pending", "activity_log"]:
+                         "hash_mappings", "local_downloads", "qnap_pending", "activity_log",
+                         "tags", "torrent_tags"]:
                 async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
                     row = await cursor.fetchone()
                     stats[table] = row[0] if row else 0

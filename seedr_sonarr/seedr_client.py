@@ -21,7 +21,7 @@ import aiofiles
 import aiohttp
 
 from .logging_config import LogContext
-from .retry import RetryHandler, CircuitBreaker, RetryConfig, CircuitBreakerConfig, RateLimiter
+from .retry import RetryHandler, CircuitBreaker, RetryConfig, CircuitBreakerConfig, RateLimiter, RateLimitTimeoutError
 from .state import TorrentPhase, extract_instance_id
 
 if TYPE_CHECKING:
@@ -143,6 +143,91 @@ def normalize_folder_name(name: str) -> str:
     return normalized.strip()
 
 
+def sanitize_path_component(name: str) -> str:
+    """
+    Sanitize a path component (category name or folder name) to prevent path traversal.
+
+    Removes:
+    - Parent directory references (..)
+    - Absolute path indicators (leading /)
+    - Null bytes
+    - Other dangerous characters
+
+    Args:
+        name: The path component to sanitize
+
+    Returns:
+        A safe path component string
+    """
+    if not name:
+        return ""
+
+    # Remove null bytes
+    sanitized = name.replace("\x00", "")
+
+    # Remove leading/trailing whitespace
+    sanitized = sanitized.strip()
+
+    # Remove absolute path indicators
+    sanitized = sanitized.lstrip("/\\")
+
+    # Remove parent directory references
+    # Handle both forward and backward slashes
+    while ".." in sanitized:
+        sanitized = sanitized.replace("..", "")
+
+    # Remove any remaining slashes (we only want a single path component)
+    sanitized = sanitized.replace("/", "_").replace("\\", "_")
+
+    # Collapse multiple underscores
+    while "__" in sanitized:
+        sanitized = sanitized.replace("__", "_")
+
+    # Strip leading/trailing underscores
+    sanitized = sanitized.strip("_")
+
+    return sanitized
+
+
+def safe_join_path(base_path: str, *components: str) -> str:
+    """
+    Safely join path components, ensuring the result stays within base_path.
+
+    Args:
+        base_path: The base directory that must contain the final path
+        *components: Path components to join (will be sanitized)
+
+    Returns:
+        A safe absolute path within base_path
+
+    Raises:
+        ValueError: If the resulting path would escape base_path
+    """
+    # Sanitize each component
+    sanitized_components = [sanitize_path_component(c) for c in components if c]
+
+    # Filter out empty components
+    sanitized_components = [c for c in sanitized_components if c]
+
+    # Join the path
+    if sanitized_components:
+        result = os.path.join(base_path, *sanitized_components)
+    else:
+        result = base_path
+
+    # Resolve to absolute path
+    result = os.path.abspath(result)
+    base_abs = os.path.abspath(base_path)
+
+    # Ensure the result is within base_path
+    if not result.startswith(base_abs + os.sep) and result != base_abs:
+        raise ValueError(
+            f"Path traversal detected: {result} is outside {base_abs}"
+        )
+
+    return result
+
+
 class SeedrClientWrapper:
     """
     Wrapper around seedrcc that provides simplified interface for the proxy.
@@ -216,6 +301,7 @@ class SeedrClientWrapper:
         self._error_counts: dict[str, int] = {}  # torrent_hash -> error count
         self._last_errors: dict[str, str] = {}  # torrent_hash -> last error message
         self._download_retry_after: dict[str, float] = {}  # torrent_hash -> timestamp when retry is allowed
+        self._error_lock = asyncio.Lock()  # Lock for error tracking
 
         # Queue system for storage management
         self._torrent_queue: deque[QueuedTorrent] = deque()
@@ -396,7 +482,7 @@ class SeedrClientWrapper:
     def _get_save_path(self, category: str = "") -> str:
         """Get the save path for a category."""
         if category:
-            return os.path.join(self.download_path, category)
+            return safe_join_path(self.download_path, category)
         return self.download_path
 
     def _determine_phase(
@@ -452,7 +538,7 @@ class SeedrClientWrapper:
                     await self._update_qnap_progress()
 
                 # Get root folder contents with retry and rate limiting
-                await self._rate_limiter.acquire()
+                await self._rate_limiter.acquire_or_raise()
                 contents = await self._retry_handler.with_retry(
                     operation=lambda: self._client.list_contents(),
                     operation_id="list_contents",
@@ -1061,7 +1147,7 @@ class SeedrClientWrapper:
                     logger.info(f"Starting QNAP download of {folder_name}")
 
                     # Get folder contents to get download URLs
-                    await self._rate_limiter.acquire()
+                    await self._rate_limiter.acquire_or_raise()
                     folder = await self._retry_handler.with_retry(
                         operation=lambda: self._client.list_contents(folder_id),
                         operation_id=f"list_folder_{folder_id}",
@@ -1127,13 +1213,15 @@ class SeedrClientWrapper:
                             f"name_mappings={list(self._name_to_hash_mapping.keys())[:5]}..."
                         )
 
-                    # Build local path and create directory
-                    if category:
-                        local_dest = os.path.join(self.download_path, category, folder_name)
-                        dest_folder = f"{self._qnap_dest_folder}/{category}/{folder_name}" if self._qnap_dest_folder else ""
+                    # Build local path and create directory (with path traversal protection)
+                    safe_folder_name = sanitize_path_component(folder_name)
+                    safe_category = sanitize_path_component(category) if category else ""
+                    if safe_category:
+                        local_dest = safe_join_path(self.download_path, safe_category, safe_folder_name)
+                        dest_folder = f"{self._qnap_dest_folder}/{safe_category}/{safe_folder_name}" if self._qnap_dest_folder else ""
                     else:
-                        local_dest = os.path.join(self.download_path, folder_name)
-                        dest_folder = f"{self._qnap_dest_folder}/{folder_name}" if self._qnap_dest_folder else ""
+                        local_dest = safe_join_path(self.download_path, safe_folder_name)
+                        dest_folder = f"{self._qnap_dest_folder}/{safe_folder_name}" if self._qnap_dest_folder else ""
 
                     # Create the destination folder on the local filesystem
                     # This is required because QNAP needs the folder to exist before downloading
@@ -1142,8 +1230,8 @@ class SeedrClientWrapper:
                     try:
                         os.chmod(local_dest, 0o777)
                         # Also set permissions on parent category folder if it exists
-                        if category:
-                            category_folder = os.path.join(self.download_path, category)
+                        if safe_category:
+                            category_folder = safe_join_path(self.download_path, safe_category)
                             os.chmod(category_folder, 0o777)
                     except OSError as e:
                         logger.warning(f"Could not set permissions on {local_dest}: {e}")
@@ -1169,7 +1257,7 @@ class SeedrClientWrapper:
                                 continue
 
                             # Get download URL from Seedr
-                            await self._rate_limiter.acquire()
+                            await self._rate_limiter.acquire_or_raise()
                             file_info = await self._retry_handler.with_retry(
                                 operation=lambda fid=folder_file_id: self._client.fetch_file(str(fid)),
                                 operation_id=f"fetch_file_{idx}",
@@ -1205,12 +1293,12 @@ class SeedrClientWrapper:
 
                         except Exception as e:
                             logger.error(f"Error adding QNAP download for {file.name}: {e}")
-                            self._record_error(torrent_hash, str(e))
+                            await self._record_error(torrent_hash, str(e))
                             failed_files.append(file.name)
 
                     if not successful_files:
                         logger.error(f"No QNAP downloads added for {folder_name}")
-                        self._record_error(torrent_hash, "No QNAP downloads added")
+                        await self._record_error(torrent_hash, "No QNAP downloads added")
                         return
 
                     # QNAP Download Station doesn't always return task IDs, so we can't
@@ -1289,7 +1377,7 @@ class SeedrClientWrapper:
             except Exception as e:
                 logger.error(f"Error in QNAP download for {folder_name}: {e}")
                 self._download_progress[torrent_hash] = 0.0
-                self._record_error(torrent_hash, str(e))
+                await self._record_error(torrent_hash, str(e))
 
     async def _download_folder_direct(self, torrent_hash: str, folder_id: str, folder_name: str, save_path: str):
         """Download all files from a Seedr folder directly via HTTP."""
@@ -1306,7 +1394,7 @@ class SeedrClientWrapper:
                         pass
 
                     # Get folder contents with retry and rate limiting
-                    await self._rate_limiter.acquire()
+                    await self._rate_limiter.acquire_or_raise()
                     folder = await self._retry_handler.with_retry(
                         operation=lambda: self._client.list_contents(folder_id),
                         operation_id=f"list_folder_{folder_id}",
@@ -1348,7 +1436,7 @@ class SeedrClientWrapper:
                                 failed_files.append(file.name)
                                 continue
 
-                            await self._rate_limiter.acquire()
+                            await self._rate_limiter.acquire_or_raise()
                             file_info = await self._retry_handler.with_retry(
                                 operation=lambda fid=folder_file_id: self._client.fetch_file(str(fid)),
                                 operation_id=f"fetch_file_{idx}",
@@ -1383,7 +1471,7 @@ class SeedrClientWrapper:
 
                         except Exception as e:
                             logger.error(f"Error downloading file {file.name}: {e}")
-                            self._record_error(torrent_hash, str(e))
+                            await self._record_error(torrent_hash, str(e))
                             failed_files.append(file.name)
                             continue
 
@@ -1447,7 +1535,7 @@ class SeedrClientWrapper:
             except Exception as e:
                 logger.error(f"Error downloading folder {folder_name}: {e}")
                 self._download_progress[torrent_hash] = 0.0
-                self._record_error(torrent_hash, str(e))
+                await self._record_error(torrent_hash, str(e))
 
     def _is_file_fetch_retryable(self, error: Exception) -> bool:
         """Check if a file fetch error should be retried.
@@ -1465,13 +1553,14 @@ class SeedrClientWrapper:
             return True
         return False
 
-    def _record_error(self, torrent_hash: str, error: str):
+    async def _record_error(self, torrent_hash: str, error: str):
         """Record an error for a torrent."""
-        self._error_counts[torrent_hash] = self._error_counts.get(torrent_hash, 0) + 1
-        self._last_errors[torrent_hash] = error
+        async with self._error_lock:
+            self._error_counts[torrent_hash] = self._error_counts.get(torrent_hash, 0) + 1
+            self._last_errors[torrent_hash] = error
 
         if self._state_manager:
-            asyncio.create_task(self._state_manager.record_error(torrent_hash, error))
+            await self._state_manager.record_error(torrent_hash, error)
 
     def _update_download_progress(self, torrent_hash: str, progress: float):
         """Update download progress for a torrent."""
@@ -1667,7 +1756,7 @@ class SeedrClientWrapper:
                                 if category:
                                     self._category_mapping[found_hash] = category
                                     self._instance_mapping[found_hash] = instance_id
-                                    cat_path = os.path.join(self.download_path, category)
+                                    cat_path = safe_join_path(self.download_path, category)
                                     os.makedirs(cat_path, exist_ok=True)
                                     try:
                                         os.chmod(cat_path, 0o777)
@@ -1712,7 +1801,7 @@ class SeedrClientWrapper:
                 if category:
                     self._category_mapping[torrent_hash] = category
                     self._instance_mapping[torrent_hash] = instance_id
-                    cat_path = os.path.join(self.download_path, category)
+                    cat_path = safe_join_path(self.download_path, category)
                     os.makedirs(cat_path, exist_ok=True)
                     try:
                         os.chmod(cat_path, 0o777)
@@ -1904,7 +1993,7 @@ class SeedrClientWrapper:
                                     logger.warning(f"Failed to persist hash mapping: {persist_err}")
 
                         if queued.category:
-                            cat_path = os.path.join(self.download_path, queued.category)
+                            cat_path = safe_join_path(self.download_path, queued.category)
                             os.makedirs(cat_path, exist_ok=True)
                             try:
                                 os.chmod(cat_path, 0o777)

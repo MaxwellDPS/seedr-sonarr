@@ -448,6 +448,11 @@ class CircuitOpenError(Exception):
     pass
 
 
+class RateLimitTimeoutError(Exception):
+    """Raised when rate limiter times out waiting for a token."""
+    pass
+
+
 class RateLimiter:
     """
     Token bucket rate limiter for API calls.
@@ -462,7 +467,7 @@ class RateLimiter:
         self.rate = rate
         self.burst = burst
         self._tokens = float(burst)
-        self._last_update = datetime.now().timestamp()
+        self._last_update: Optional[float] = None  # Lazy init on first acquire
         self._lock = asyncio.Lock()
         self._total_requests = 0
         self._throttled_requests = 0
@@ -477,11 +482,15 @@ class RateLimiter:
         Returns:
             True if token acquired, False if timeout
         """
-        start_time = asyncio.get_event_loop().time()
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
 
         while True:
             async with self._lock:
-                now = datetime.now().timestamp()
+                now = loop.time()
+                # Lazy initialization of _last_update on first call
+                if self._last_update is None:
+                    self._last_update = now
                 elapsed = now - self._last_update
                 self._last_update = now
 
@@ -506,6 +515,21 @@ class RateLimiter:
 
             # Wait for tokens to refill
             await asyncio.sleep(min(wait_time, 0.1))
+
+    async def acquire_or_raise(self, timeout: float = 30.0) -> None:
+        """
+        Acquire a token or raise an exception.
+
+        Args:
+            timeout: Maximum time to wait for a token
+
+        Raises:
+            RateLimitTimeoutError: If timeout waiting for token
+        """
+        if not await self.acquire(timeout):
+            raise RateLimitTimeoutError(
+                f"Rate limiter timeout after {timeout}s waiting for token"
+            )
 
     def get_stats(self) -> dict:
         """Get rate limiter statistics."""

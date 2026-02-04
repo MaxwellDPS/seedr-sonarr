@@ -16,6 +16,8 @@ from seedr_sonarr.retry import (
     CircuitState,
     CircuitOpenError,
     ResilientExecutor,
+    RateLimiter,
+    RateLimitTimeoutError,
 )
 
 
@@ -639,3 +641,68 @@ class TestRetryHandlerIsRetryable:
     def test_rate_limit_is_retryable(self, handler):
         """Test rate limit errors are retryable."""
         assert handler._is_retryable(Exception("Rate limit exceeded")) is True
+
+
+class TestRateLimiter:
+    """Tests for RateLimiter."""
+
+    @pytest.fixture
+    def limiter(self):
+        """Create a rate limiter with high burst for tests."""
+        return RateLimiter(rate=100.0, burst=10)
+
+    @pytest.mark.asyncio
+    async def test_acquire_success(self, limiter):
+        """Test successful token acquisition."""
+        result = await limiter.acquire()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_acquire_or_raise_success(self, limiter):
+        """Test acquire_or_raise doesn't raise when tokens available."""
+        await limiter.acquire_or_raise()  # Should not raise
+
+    @pytest.mark.asyncio
+    async def test_acquire_timeout(self):
+        """Test acquire returns False on timeout."""
+        # Create limiter with very low rate and empty burst
+        limiter = RateLimiter(rate=0.1, burst=1)
+        # Exhaust the burst
+        await limiter.acquire()
+        # This should timeout
+        result = await limiter.acquire(timeout=0.1)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_acquire_or_raise_timeout(self):
+        """Test acquire_or_raise raises on timeout."""
+        limiter = RateLimiter(rate=0.1, burst=1)
+        # Exhaust the burst
+        await limiter.acquire()
+        # This should raise
+        with pytest.raises(RateLimitTimeoutError):
+            await limiter.acquire_or_raise(timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_stats(self, limiter):
+        """Test rate limiter statistics."""
+        await limiter.acquire()
+        stats = limiter.get_stats()
+        assert stats["total_requests"] == 1
+        assert stats["throttled_requests"] == 0
+        assert stats["rate_per_second"] == 100.0
+        assert stats["burst_size"] == 10
+
+
+class TestRateLimitTimeoutError:
+    """Tests for RateLimitTimeoutError."""
+
+    def test_creation(self):
+        """Test error creation."""
+        error = RateLimitTimeoutError("Test timeout")
+        assert str(error) == "Test timeout"
+
+    def test_is_exception(self):
+        """Test it's a proper exception."""
+        with pytest.raises(RateLimitTimeoutError):
+            raise RateLimitTimeoutError("test")
