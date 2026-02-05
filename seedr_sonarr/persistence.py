@@ -107,6 +107,28 @@ class PersistedTag:
             self.created_at = datetime.now().timestamp()
 
 
+@dataclass
+class PersistedNameHashMapping:
+    """Name-to-hash mapping for tracking hash transitions across restarts."""
+    id: Optional[int]
+    normalized_name: str
+    original_name: str
+    torrent_hash: str
+    category: str = ""
+    instance_id: str = ""
+    magnet_hash: Optional[str] = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    is_active: int = 1
+
+    def __post_init__(self):
+        now = datetime.now().timestamp()
+        if not self.created_at:
+            self.created_at = now
+        if not self.updated_at:
+            self.updated_at = now
+
+
 # SQL Schema
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS torrents (
@@ -192,6 +214,19 @@ CREATE TABLE IF NOT EXISTS torrent_tags (
     PRIMARY KEY (torrent_hash, tag_name)
 );
 
+CREATE TABLE IF NOT EXISTS name_hash_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    normalized_name TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    torrent_hash TEXT NOT NULL,
+    category TEXT DEFAULT '',
+    instance_id TEXT DEFAULT '',
+    magnet_hash TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    is_active INTEGER DEFAULT 1
+);
+
 CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_torrent_tags_hash ON torrent_tags(torrent_hash);
 CREATE INDEX IF NOT EXISTS idx_torrent_tags_name ON torrent_tags(tag_name);
@@ -199,6 +234,10 @@ CREATE INDEX IF NOT EXISTS idx_torrents_instance ON torrents(instance_id);
 CREATE INDEX IF NOT EXISTS idx_categories_instance ON categories(instance_id);
 CREATE INDEX IF NOT EXISTS idx_torrents_state ON torrents(state);
 CREATE INDEX IF NOT EXISTS idx_queued_added ON queued_torrents(added_time);
+CREATE INDEX IF NOT EXISTS idx_nhm_normalized ON name_hash_mappings(normalized_name);
+CREATE INDEX IF NOT EXISTS idx_nhm_instance ON name_hash_mappings(instance_id, normalized_name);
+CREATE INDEX IF NOT EXISTS idx_nhm_magnet ON name_hash_mappings(magnet_hash);
+CREATE INDEX IF NOT EXISTS idx_nhm_hash ON name_hash_mappings(torrent_hash);
 """
 
 
@@ -872,6 +911,195 @@ class PersistenceManager:
             logger.debug(f"Cleared all tags from torrent {torrent_hash}")
 
     # -------------------------------------------------------------------------
+    # Name Hash Mapping Operations
+    # -------------------------------------------------------------------------
+
+    async def save_name_hash_mapping(
+        self,
+        normalized_name: str,
+        original_name: str,
+        torrent_hash: str,
+        category: str = "",
+        instance_id: str = "",
+        magnet_hash: Optional[str] = None,
+    ) -> None:
+        """Save a name-to-hash mapping for tracking hash transitions."""
+        now = datetime.now().timestamp()
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check if mapping already exists for this normalized name and instance
+            async with db.execute(
+                """SELECT id FROM name_hash_mappings
+                   WHERE normalized_name = ? AND instance_id = ? AND is_active = 1""",
+                (normalized_name, instance_id)
+            ) as cursor:
+                existing = await cursor.fetchone()
+
+            if existing:
+                # Update existing mapping
+                await db.execute(
+                    """UPDATE name_hash_mappings
+                       SET torrent_hash = ?, original_name = ?, category = ?,
+                           magnet_hash = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (torrent_hash, original_name, category, magnet_hash, now, existing[0])
+                )
+            else:
+                # Insert new mapping
+                await db.execute(
+                    """INSERT INTO name_hash_mappings
+                       (normalized_name, original_name, torrent_hash, category,
+                        instance_id, magnet_hash, created_at, updated_at, is_active)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                    (normalized_name, original_name, torrent_hash, category,
+                     instance_id, magnet_hash, now, now)
+                )
+            await db.commit()
+            logger.debug(f"Saved name hash mapping: {normalized_name} -> {torrent_hash}")
+
+    async def get_name_hash_mapping(
+        self,
+        normalized_name: str,
+        instance_id: Optional[str] = None,
+    ) -> Optional["PersistedNameHashMapping"]:
+        """Get a name-to-hash mapping, optionally filtered by instance."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            if instance_id is not None:
+                # Try exact instance match first
+                async with db.execute(
+                    """SELECT * FROM name_hash_mappings
+                       WHERE normalized_name = ? AND instance_id = ? AND is_active = 1
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (normalized_name, instance_id)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return PersistedNameHashMapping(
+                            id=row["id"],
+                            normalized_name=row["normalized_name"],
+                            original_name=row["original_name"],
+                            torrent_hash=row["torrent_hash"],
+                            category=row["category"],
+                            instance_id=row["instance_id"],
+                            magnet_hash=row["magnet_hash"],
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            is_active=row["is_active"],
+                        )
+
+            # Fall back to any instance if no exact match
+            async with db.execute(
+                """SELECT * FROM name_hash_mappings
+                   WHERE normalized_name = ? AND is_active = 1
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (normalized_name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return PersistedNameHashMapping(
+                        id=row["id"],
+                        normalized_name=row["normalized_name"],
+                        original_name=row["original_name"],
+                        torrent_hash=row["torrent_hash"],
+                        category=row["category"],
+                        instance_id=row["instance_id"],
+                        magnet_hash=row["magnet_hash"],
+                        created_at=row["created_at"],
+                        updated_at=row["updated_at"],
+                        is_active=row["is_active"],
+                    )
+            return None
+
+    async def get_name_hash_mapping_by_magnet(
+        self,
+        magnet_hash: str,
+    ) -> Optional["PersistedNameHashMapping"]:
+        """Get a name-to-hash mapping by magnet info hash."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM name_hash_mappings
+                   WHERE magnet_hash = ? AND is_active = 1
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (magnet_hash,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return PersistedNameHashMapping(
+                        id=row["id"],
+                        normalized_name=row["normalized_name"],
+                        original_name=row["original_name"],
+                        torrent_hash=row["torrent_hash"],
+                        category=row["category"],
+                        instance_id=row["instance_id"],
+                        magnet_hash=row["magnet_hash"],
+                        created_at=row["created_at"],
+                        updated_at=row["updated_at"],
+                        is_active=row["is_active"],
+                    )
+            return None
+
+    async def get_all_name_hash_mappings(self) -> List["PersistedNameHashMapping"]:
+        """Get all active name-to-hash mappings."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM name_hash_mappings WHERE is_active = 1"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [PersistedNameHashMapping(
+                    id=row["id"],
+                    normalized_name=row["normalized_name"],
+                    original_name=row["original_name"],
+                    torrent_hash=row["torrent_hash"],
+                    category=row["category"],
+                    instance_id=row["instance_id"],
+                    magnet_hash=row["magnet_hash"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                    is_active=row["is_active"],
+                ) for row in rows]
+
+    async def update_name_hash_mapping_hash(
+        self,
+        old_hash: str,
+        new_hash: str,
+    ) -> int:
+        """Update all mappings pointing to old_hash to point to new_hash.
+        Returns the number of mappings updated."""
+        now = datetime.now().timestamp()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE name_hash_mappings
+                   SET torrent_hash = ?, updated_at = ?
+                   WHERE torrent_hash = ? AND is_active = 1""",
+                (new_hash, now, old_hash)
+            )
+            await db.commit()
+            count = cursor.rowcount
+            if count > 0:
+                logger.debug(f"Updated {count} name hash mappings: {old_hash} -> {new_hash}")
+            return count
+
+    async def deactivate_name_hash_mappings(self, torrent_hash: str) -> int:
+        """Deactivate all mappings for a torrent hash (on deletion).
+        Returns the number of mappings deactivated."""
+        now = datetime.now().timestamp()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE name_hash_mappings
+                   SET is_active = 0, updated_at = ?
+                   WHERE torrent_hash = ? AND is_active = 1""",
+                (now, torrent_hash)
+            )
+            await db.commit()
+            count = cursor.rowcount
+            if count > 0:
+                logger.debug(f"Deactivated {count} name hash mappings for {torrent_hash}")
+            return count
+
+    # -------------------------------------------------------------------------
     # Utility Operations
     # -------------------------------------------------------------------------
 
@@ -881,7 +1109,7 @@ class PersistenceManager:
         ALLOWED_TABLES = frozenset([
             "torrents", "queued_torrents", "categories",
             "hash_mappings", "local_downloads", "qnap_pending", "activity_log",
-            "tags", "torrent_tags"
+            "tags", "torrent_tags", "name_hash_mappings"
         ])
 
         try:

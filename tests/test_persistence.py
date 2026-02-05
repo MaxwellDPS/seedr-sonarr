@@ -15,6 +15,7 @@ from seedr_sonarr.persistence import (
     PersistedQueuedTorrent,
     PersistedCategory,
     ActivityLogEntry,
+    PersistedNameHashMapping,
 )
 
 
@@ -556,3 +557,171 @@ class TestUtilityOperations:
         """Test database vacuum operation."""
         # Just verify it doesn't raise
         await persistence.vacuum()
+
+
+class TestNameHashMappingOperations:
+    """Test name hash mapping operations for robust category recovery."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_get_name_hash_mapping(self, persistence):
+        """Test saving and retrieving a name hash mapping."""
+        await persistence.save_name_hash_mapping(
+            normalized_name="test movie 2024",
+            original_name="Test.Movie.2024",
+            torrent_hash="ABC123",
+            category="radarr",
+            instance_id="radarr",
+            magnet_hash="DEADBEEF1234",
+        )
+
+        mapping = await persistence.get_name_hash_mapping("test movie 2024")
+        assert mapping is not None
+        assert mapping.normalized_name == "test movie 2024"
+        assert mapping.original_name == "Test.Movie.2024"
+        assert mapping.torrent_hash == "ABC123"
+        assert mapping.category == "radarr"
+        assert mapping.instance_id == "radarr"
+        assert mapping.magnet_hash == "DEADBEEF1234"
+        assert mapping.is_active == 1
+
+    @pytest.mark.asyncio
+    async def test_get_name_hash_mapping_with_instance(self, persistence):
+        """Test retrieving mapping with instance filter."""
+        # Add two mappings with same name but different instances
+        await persistence.save_name_hash_mapping(
+            normalized_name="same name",
+            original_name="Same Name",
+            torrent_hash="HASH1",
+            category="radarr",
+            instance_id="radarr",
+        )
+        await persistence.save_name_hash_mapping(
+            normalized_name="same name",
+            original_name="Same Name",
+            torrent_hash="HASH2",
+            category="sonarr",
+            instance_id="sonarr",
+        )
+
+        # Get with specific instance
+        mapping = await persistence.get_name_hash_mapping("same name", instance_id="sonarr")
+        assert mapping is not None
+        assert mapping.torrent_hash == "HASH2"
+        assert mapping.instance_id == "sonarr"
+
+        # Get with different instance
+        mapping = await persistence.get_name_hash_mapping("same name", instance_id="radarr")
+        assert mapping is not None
+        assert mapping.torrent_hash == "HASH1"
+        assert mapping.instance_id == "radarr"
+
+    @pytest.mark.asyncio
+    async def test_get_name_hash_mapping_by_magnet(self, persistence):
+        """Test retrieving mapping by magnet hash."""
+        await persistence.save_name_hash_mapping(
+            normalized_name="torrent with magnet",
+            original_name="Torrent With Magnet",
+            torrent_hash="HASH123",
+            category="radarr",
+            instance_id="radarr",
+            magnet_hash="MAGNETABC123",
+        )
+
+        mapping = await persistence.get_name_hash_mapping_by_magnet("MAGNETABC123")
+        assert mapping is not None
+        assert mapping.torrent_hash == "HASH123"
+        assert mapping.magnet_hash == "MAGNETABC123"
+
+    @pytest.mark.asyncio
+    async def test_get_all_name_hash_mappings(self, persistence):
+        """Test retrieving all active mappings."""
+        for i in range(3):
+            await persistence.save_name_hash_mapping(
+                normalized_name=f"torrent {i}",
+                original_name=f"Torrent {i}",
+                torrent_hash=f"HASH{i}",
+                category="radarr",
+                instance_id="radarr",
+            )
+
+        mappings = await persistence.get_all_name_hash_mappings()
+        assert len(mappings) == 3
+
+    @pytest.mark.asyncio
+    async def test_update_name_hash_mapping_hash(self, persistence):
+        """Test updating the hash in a mapping (for hash transitions)."""
+        await persistence.save_name_hash_mapping(
+            normalized_name="transitioning torrent",
+            original_name="Transitioning Torrent",
+            torrent_hash="OLD_HASH",
+            category="radarr",
+            instance_id="radarr",
+        )
+
+        # Update hash
+        count = await persistence.update_name_hash_mapping_hash("OLD_HASH", "NEW_HASH")
+        assert count == 1
+
+        # Verify update
+        mapping = await persistence.get_name_hash_mapping("transitioning torrent")
+        assert mapping.torrent_hash == "NEW_HASH"
+
+    @pytest.mark.asyncio
+    async def test_deactivate_name_hash_mappings(self, persistence):
+        """Test deactivating mappings when torrent is deleted."""
+        await persistence.save_name_hash_mapping(
+            normalized_name="to delete",
+            original_name="To Delete",
+            torrent_hash="DELETE_HASH",
+            category="radarr",
+            instance_id="radarr",
+        )
+
+        # Deactivate
+        count = await persistence.deactivate_name_hash_mappings("DELETE_HASH")
+        assert count == 1
+
+        # Should not be returned anymore
+        mapping = await persistence.get_name_hash_mapping("to delete")
+        assert mapping is None
+
+    @pytest.mark.asyncio
+    async def test_save_updates_existing_mapping(self, persistence):
+        """Test that saving a mapping with same name/instance updates it."""
+        await persistence.save_name_hash_mapping(
+            normalized_name="update test",
+            original_name="Update Test",
+            torrent_hash="ORIGINAL_HASH",
+            category="radarr",
+            instance_id="radarr",
+        )
+
+        # Save again with same name/instance but different hash
+        await persistence.save_name_hash_mapping(
+            normalized_name="update test",
+            original_name="Update Test V2",
+            torrent_hash="UPDATED_HASH",
+            category="radarr-4k",
+            instance_id="radarr",
+        )
+
+        # Should only have one mapping
+        mappings = await persistence.get_all_name_hash_mappings()
+        assert len(mappings) == 1
+        assert mappings[0].torrent_hash == "UPDATED_HASH"
+        assert mappings[0].category == "radarr-4k"
+
+    @pytest.mark.asyncio
+    async def test_name_hash_mapping_in_stats(self, persistence):
+        """Test that name_hash_mappings table is included in stats."""
+        await persistence.save_name_hash_mapping(
+            normalized_name="stats test",
+            original_name="Stats Test",
+            torrent_hash="STATS_HASH",
+            category="radarr",
+            instance_id="radarr",
+        )
+
+        stats = await persistence.get_stats()
+        assert "name_hash_mappings" in stats
+        assert stats["name_hash_mappings"] == 1

@@ -18,6 +18,7 @@ from .persistence import (
     PersistedQueuedTorrent,
     PersistedCategory,
     PersistedQnapPending,
+    PersistedNameHashMapping,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,8 @@ class StateManager:
         self._local_downloads: Set[str] = set()
         self._tags: Set[str] = set()  # Set of all tag names
         self._torrent_tags: Dict[str, Set[str]] = {}  # torrent_hash -> set of tags
+        # Name hash mappings cache: (normalized_name, instance_id) -> PersistedNameHashMapping
+        self._name_hash_mappings: Dict[tuple, PersistedNameHashMapping] = {}
 
         # Activity callbacks (protected by _callback_lock)
         self._callback_lock = asyncio.Lock()
@@ -245,6 +248,13 @@ class StateManager:
                 if tags:
                     self._torrent_tags[torrent_hash] = set(tags)
             logger.info(f"Loaded tags for {len(self._torrent_tags)} torrents from persistence")
+
+            # Load name hash mappings
+            name_hash_mappings = await self._persistence.get_all_name_hash_mappings()
+            for mapping in name_hash_mappings:
+                cache_key = (mapping.normalized_name, mapping.instance_id)
+                self._name_hash_mappings[cache_key] = mapping
+            logger.info(f"Loaded {len(self._name_hash_mappings)} name hash mappings from persistence")
 
         except Exception as e:
             logger.error(f"Error loading state from persistence: {e}")
@@ -957,6 +967,154 @@ class StateManager:
             real_hash = self._hash_mappings.get(hash.upper(), hash.upper())
             tags = self._torrent_tags.get(real_hash, set())
             return sorted(list(tags))
+
+    # -------------------------------------------------------------------------
+    # Name Hash Mapping Operations
+    # -------------------------------------------------------------------------
+
+    async def add_name_hash_mapping(
+        self,
+        normalized_name: str,
+        original_name: str,
+        torrent_hash: str,
+        category: str = "",
+        instance_id: str = "",
+        magnet_hash: Optional[str] = None,
+    ) -> None:
+        """Add or update a name-to-hash mapping for tracking hash transitions."""
+        async with self._lock:
+            cache_key = (normalized_name, instance_id)
+
+            # Create mapping object
+            mapping = PersistedNameHashMapping(
+                id=None,
+                normalized_name=normalized_name,
+                original_name=original_name,
+                torrent_hash=torrent_hash,
+                category=category,
+                instance_id=instance_id,
+                magnet_hash=magnet_hash,
+            )
+
+            # Update cache
+            self._name_hash_mappings[cache_key] = mapping
+
+            # Persist
+            if self._persist_enabled:
+                await self._persistence.save_name_hash_mapping(
+                    normalized_name=normalized_name,
+                    original_name=original_name,
+                    torrent_hash=torrent_hash,
+                    category=category,
+                    instance_id=instance_id,
+                    magnet_hash=magnet_hash,
+                )
+
+    async def get_name_hash_mapping(
+        self,
+        normalized_name: str,
+        instance_id: Optional[str] = None,
+    ) -> Optional[PersistedNameHashMapping]:
+        """Get a name-to-hash mapping, optionally filtered by instance."""
+        async with self._lock:
+            # Try exact cache match first
+            if instance_id is not None:
+                cache_key = (normalized_name, instance_id)
+                if cache_key in self._name_hash_mappings:
+                    return self._name_hash_mappings[cache_key]
+
+            # Try any instance in cache
+            for (name, inst), mapping in self._name_hash_mappings.items():
+                if name == normalized_name:
+                    return mapping
+
+            # Fall back to persistence lookup
+            if self._persist_enabled:
+                mapping = await self._persistence.get_name_hash_mapping(
+                    normalized_name, instance_id
+                )
+                if mapping:
+                    # Update cache
+                    cache_key = (mapping.normalized_name, mapping.instance_id)
+                    self._name_hash_mappings[cache_key] = mapping
+                return mapping
+
+            return None
+
+    async def get_name_hash_mapping_by_magnet(
+        self,
+        magnet_hash: str,
+    ) -> Optional[PersistedNameHashMapping]:
+        """Get a name-to-hash mapping by magnet info hash."""
+        async with self._lock:
+            # Check cache first
+            for mapping in self._name_hash_mappings.values():
+                if mapping.magnet_hash == magnet_hash:
+                    return mapping
+
+            # Fall back to persistence
+            if self._persist_enabled:
+                mapping = await self._persistence.get_name_hash_mapping_by_magnet(magnet_hash)
+                if mapping:
+                    # Update cache
+                    cache_key = (mapping.normalized_name, mapping.instance_id)
+                    self._name_hash_mappings[cache_key] = mapping
+                return mapping
+
+            return None
+
+    async def update_name_hash_transition(
+        self,
+        normalized_name: str,
+        old_hash: str,
+        new_hash: str,
+        instance_id: str = "",
+    ) -> None:
+        """Update a name hash mapping when a hash transition occurs."""
+        async with self._lock:
+            cache_key = (normalized_name, instance_id)
+
+            # Update cache
+            if cache_key in self._name_hash_mappings:
+                mapping = self._name_hash_mappings[cache_key]
+                # Create updated mapping
+                updated_mapping = PersistedNameHashMapping(
+                    id=mapping.id,
+                    normalized_name=mapping.normalized_name,
+                    original_name=mapping.original_name,
+                    torrent_hash=new_hash,
+                    category=mapping.category,
+                    instance_id=mapping.instance_id,
+                    magnet_hash=mapping.magnet_hash,
+                    created_at=mapping.created_at,
+                )
+                self._name_hash_mappings[cache_key] = updated_mapping
+
+            # Update persistence
+            if self._persist_enabled:
+                await self._persistence.update_name_hash_mapping_hash(old_hash, new_hash)
+
+            logger.debug(f"Updated name hash transition: {old_hash} -> {new_hash} for {normalized_name}")
+
+    async def deactivate_name_hash_mappings(self, torrent_hash: str) -> None:
+        """Deactivate all name hash mappings for a deleted torrent."""
+        async with self._lock:
+            # Remove from cache
+            keys_to_remove = [
+                key for key, mapping in self._name_hash_mappings.items()
+                if mapping.torrent_hash == torrent_hash
+            ]
+            for key in keys_to_remove:
+                del self._name_hash_mappings[key]
+
+            # Deactivate in persistence
+            if self._persist_enabled:
+                await self._persistence.deactivate_name_hash_mappings(torrent_hash)
+
+    async def get_all_name_hash_mappings(self) -> List[PersistedNameHashMapping]:
+        """Get all active name hash mappings."""
+        async with self._lock:
+            return list(self._name_hash_mappings.values())
 
 
 def extract_instance_id(category: str) -> str:

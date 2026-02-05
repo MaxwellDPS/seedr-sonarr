@@ -432,10 +432,21 @@ class SeedrClientWrapper:
                 if pending.folder_name:
                     self._name_to_hash_mapping[normalize_folder_name(pending.folder_name)] = pending.torrent_hash
 
+            # Restore name hash mappings from persistent storage
+            # This ensures category recovery works across server restarts
+            name_hash_mappings = await self._state_manager.get_all_name_hash_mappings()
+            for mapping in name_hash_mappings:
+                self._name_to_hash_mapping[mapping.normalized_name] = mapping.torrent_hash
+                # Also restore category/instance mappings if not already set
+                if mapping.category and mapping.torrent_hash not in self._category_mapping:
+                    self._category_mapping[mapping.torrent_hash] = mapping.category
+                    self._instance_mapping[mapping.torrent_hash] = mapping.instance_id
+
             logger.info(
                 f"Restored state: {len(self._local_downloads)} local downloads, "
                 f"{len(self._torrent_queue)} queued torrents, "
-                f"{len(self._qnap_pending_completion)} QNAP pending"
+                f"{len(self._qnap_pending_completion)} QNAP pending, "
+                f"{len(name_hash_mappings)} name hash mappings"
             )
 
         except Exception as e:
@@ -643,6 +654,29 @@ class SeedrClientWrapper:
                     # If no category found, try to look up by name (for hash transitions)
                     # Use normalized name for lookups (Seedr may change + to spaces, etc.)
                     normalized_folder_name = normalize_folder_name(folder.name)
+
+                    # First try: use persistent name hash mapping (survives restarts)
+                    if not category and self._state_manager:
+                        mapping = await self._state_manager.get_name_hash_mapping(
+                            normalized_folder_name, instance_id=instance_id if instance_id else None
+                        )
+                        if mapping and mapping.category:
+                            original_hash = mapping.torrent_hash
+                            category = mapping.category
+                            instance_id = mapping.instance_id or extract_instance_id(category)
+                            # Copy mapping to new hash for future lookups
+                            self._category_mapping[torrent_hash] = category
+                            self._instance_mapping[torrent_hash] = instance_id
+                            # Update name mapping to point to new hash
+                            self._name_to_hash_mapping[normalized_folder_name] = torrent_hash
+                            # Persist the hash transition
+                            await self._state_manager.update_name_hash_transition(
+                                normalized_folder_name, original_hash, torrent_hash, instance_id
+                            )
+                            await self._state_manager.add_hash_mapping(original_hash, torrent_hash)
+                            logger.info(f"Hash transition detected (persistent): {original_hash} -> {torrent_hash} (category: {category})")
+
+                    # Second try: in-memory name mapping (for same-session transitions)
                     if not category and normalized_folder_name in self._name_to_hash_mapping:
                         original_hash = self._name_to_hash_mapping[normalized_folder_name]
                         category = self._category_mapping.get(original_hash, "")
@@ -655,8 +689,11 @@ class SeedrClientWrapper:
                             self._name_to_hash_mapping[normalized_folder_name] = torrent_hash
                             # Persist the hash transition
                             if self._state_manager:
+                                await self._state_manager.update_name_hash_transition(
+                                    normalized_folder_name, original_hash, torrent_hash, instance_id
+                                )
                                 await self._state_manager.add_hash_mapping(original_hash, torrent_hash)
-                            logger.info(f"Hash transition detected: {original_hash} -> {torrent_hash} (category: {category})")
+                            logger.info(f"Hash transition detected (in-memory): {original_hash} -> {torrent_hash} (category: {category})")
 
                     # Fallback: try fuzzy name match in persistence if category still not found
                     # This handles cases where Seedr significantly changed the folder name
@@ -1845,11 +1882,12 @@ class SeedrClientWrapper:
                     torrent_hash = f"SEEDR{id(result):016X}".upper()
 
                 name = getattr(result, 'name', name)
+                normalized_name = normalize_folder_name(name) if name and name != "Unknown Torrent" else ""
 
                 # Always track name → hash for folder transitions (even without category)
                 # Use normalized name for consistent lookups (Seedr may change + to spaces, etc.)
-                if name and name != "Unknown Torrent":
-                    self._name_to_hash_mapping[normalize_folder_name(name)] = torrent_hash
+                if normalized_name:
+                    self._name_to_hash_mapping[normalized_name] = torrent_hash
 
                 if category:
                     self._category_mapping[torrent_hash] = category
@@ -1873,6 +1911,21 @@ class SeedrClientWrapper:
                         category=category,
                         details=f"Added to Seedr (instance: {instance_id})",
                     )
+
+                    # Persist name-to-hash mapping for robust category recovery across restarts
+                    # Extract magnet info hash as stable identifier (survives Seedr hash changes)
+                    magnet_hash = self._extract_info_hash_from_magnet(magnet_link) if magnet_link else None
+                    if normalized_name:
+                        await self._state_manager.add_name_hash_mapping(
+                            normalized_name=normalized_name,
+                            original_name=name,
+                            torrent_hash=torrent_hash,
+                            category=category,
+                            instance_id=instance_id,
+                            magnet_hash=magnet_hash,
+                        )
+                        logger.debug(f"Persisted name hash mapping: {normalized_name} -> {torrent_hash} (magnet: {magnet_hash})")
+
                     # Persist the torrent early so we can recover category via fuzzy name match
                     # if Seedr changes the folder name during processing
                     if category:
@@ -1908,6 +1961,33 @@ class SeedrClientWrapper:
         except Exception:
             pass
         return "Unknown Torrent"
+
+    def _extract_info_hash_from_magnet(self, magnet_link: str) -> Optional[str]:
+        """
+        Extract btih (BitTorrent info hash) from magnet link as a stable identifier.
+        This hash remains constant even when Seedr changes the torrent hash on completion.
+        """
+        try:
+            parsed = urllib.parse.urlparse(magnet_link)
+            params = urllib.parse.parse_qs(parsed.query)
+            if 'xt' in params:
+                for xt in params['xt']:
+                    # Format: urn:btih:HASH
+                    if xt.lower().startswith('urn:btih:'):
+                        info_hash = xt[9:].upper()
+                        # Handle base32 encoded hashes (40 hex chars or 32 base32 chars)
+                        if len(info_hash) == 32:
+                            # Base32 encoded, convert to hex
+                            import base64
+                            try:
+                                decoded = base64.b32decode(info_hash)
+                                info_hash = decoded.hex().upper()
+                            except Exception:
+                                pass
+                        return info_hash
+        except Exception:
+            pass
+        return None
 
     async def set_category_mapping(self, torrent_hash: str, category: str, instance_id: str = ""):
         """Thread-safe method to set category and instance mapping for a torrent."""
