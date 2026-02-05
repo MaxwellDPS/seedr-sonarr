@@ -33,6 +33,17 @@ class RetryConfig:
     jitter: bool = True
     jitter_factor: float = 0.5  # Random factor 0.5-1.5x
 
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
+        if self.initial_delay < 0:
+            raise ValueError(f"initial_delay must be >= 0, got {self.initial_delay}")
+        if self.max_delay < 0:
+            raise ValueError(f"max_delay must be >= 0, got {self.max_delay}")
+        if self.exponential_base <= 0:
+            raise ValueError(f"exponential_base must be > 0, got {self.exponential_base}")
+
     # Specific operation limits
     seedr_api_max_attempts: int = 5
     download_max_attempts: int = 3
@@ -88,6 +99,7 @@ class RetryHandler:
         self._failure_counts: Dict[str, int] = {}
         self._last_attempt: Dict[str, float] = {}
         self._stats = RetryStats()
+        self._max_tracked_operations = 1000  # Limit to prevent memory leak
 
     async def with_retry(
         self,
@@ -143,6 +155,10 @@ class RetryHandler:
                 self._stats.last_error = str(e)
                 self._stats.last_error_time = datetime.now().timestamp()
 
+                # Prune old entries to prevent memory leak
+                if len(self._failure_counts) > self._max_tracked_operations:
+                    self._prune_old_entries()
+
                 # Check if error is retryable
                 is_retryable = self._is_retryable(e, should_retry)
 
@@ -177,7 +193,9 @@ class RetryHandler:
                 await asyncio.sleep(delay)
 
         # Should not reach here, but just in case
-        raise last_exception
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError(f"Retry loop completed without result for {operation_id}")
 
     def _is_retryable(
         self,
@@ -230,6 +248,17 @@ class RetryHandler:
         self._failure_counts.pop(operation_id, None)
         self._last_attempt.pop(operation_id, None)
 
+    def _prune_old_entries(self) -> None:
+        """Remove oldest entries to prevent memory leak."""
+        if not self._last_attempt:
+            return
+        # Remove oldest half of entries
+        sorted_ops = sorted(self._last_attempt.items(), key=lambda x: x[1])
+        ops_to_remove = [op_id for op_id, _ in sorted_ops[:len(sorted_ops) // 2]]
+        for op_id in ops_to_remove:
+            self._failure_counts.pop(op_id, None)
+            self._last_attempt.pop(op_id, None)
+
     def get_stats(self) -> dict:
         """Get retry statistics."""
         return {
@@ -254,6 +283,17 @@ class CircuitBreakerConfig:
     success_threshold: int = 2      # Successes in half-open to close
     reset_timeout: float = 60.0     # Seconds before half-open
     half_open_max_calls: int = 3    # Max concurrent calls in half-open
+
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.failure_threshold < 1:
+            raise ValueError(f"failure_threshold must be >= 1, got {self.failure_threshold}")
+        if self.success_threshold < 1:
+            raise ValueError(f"success_threshold must be >= 1, got {self.success_threshold}")
+        if self.reset_timeout < 0:
+            raise ValueError(f"reset_timeout must be >= 0, got {self.reset_timeout}")
+        if self.half_open_max_calls < 1:
+            raise ValueError(f"half_open_max_calls must be >= 1, got {self.half_open_max_calls}")
 
 
 class CircuitBreaker:
@@ -464,6 +504,10 @@ class RateLimiter:
         rate: float = 10.0,  # requests per second
         burst: int = 20,     # max burst size
     ):
+        if rate <= 0:
+            raise ValueError(f"rate must be > 0, got {rate}")
+        if burst < 1:
+            raise ValueError(f"burst must be >= 1, got {burst}")
         self.rate = rate
         self.burst = burst
         self._tokens = float(burst)

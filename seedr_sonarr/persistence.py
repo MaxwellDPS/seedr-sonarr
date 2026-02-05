@@ -243,21 +243,25 @@ class PersistenceManager:
         """Save or update a torrent."""
         torrent.updated_at = datetime.now().timestamp()
 
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO torrents
-                (hash, seedr_id, name, size, category, instance_id, state, phase,
-                 seedr_progress, local_progress, added_on, save_path, content_path,
-                 error_count, last_error, last_error_time, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                torrent.hash, torrent.seedr_id, torrent.name, torrent.size,
-                torrent.category, torrent.instance_id, torrent.state, torrent.phase,
-                torrent.seedr_progress, torrent.local_progress, torrent.added_on,
-                torrent.save_path, torrent.content_path, torrent.error_count,
-                torrent.last_error, torrent.last_error_time, torrent.updated_at
-            ))
-            await db.commit()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    INSERT OR REPLACE INTO torrents
+                    (hash, seedr_id, name, size, category, instance_id, state, phase,
+                     seedr_progress, local_progress, added_on, save_path, content_path,
+                     error_count, last_error, last_error_time, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    torrent.hash, torrent.seedr_id, torrent.name, torrent.size,
+                    torrent.category, torrent.instance_id, torrent.state, torrent.phase,
+                    torrent.seedr_progress, torrent.local_progress, torrent.added_on,
+                    torrent.save_path, torrent.content_path, torrent.error_count,
+                    torrent.last_error, torrent.last_error_time, torrent.updated_at
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save torrent {torrent.hash}: {e}")
+            raise
 
     async def get_torrents(self) -> List[PersistedTorrent]:
         """Get all persisted torrents."""
@@ -317,9 +321,15 @@ class PersistenceManager:
 
     async def delete_torrent(self, hash: str) -> None:
         """Delete a torrent."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM torrents WHERE hash = ?", (hash,))
-            await db.commit()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # Also clean up torrent tags (cascade delete)
+                await db.execute("DELETE FROM torrent_tags WHERE torrent_hash = ?", (hash.upper(),))
+                await db.execute("DELETE FROM torrents WHERE hash = ?", (hash,))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to delete torrent {hash}: {e}")
+            raise
 
     async def update_torrent_progress(
         self, hash: str, seedr_progress: float = None, local_progress: float = None
@@ -433,13 +443,19 @@ class PersistenceManager:
 
     async def clear_queue(self) -> int:
         """Clear all queued torrents. Returns count deleted."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT COUNT(*) FROM queued_torrents") as cursor:
-                row = await cursor.fetchone()
-                count = row[0] if row else 0
-            await db.execute("DELETE FROM queued_torrents")
-            await db.commit()
-            return count
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # Use a single transaction to ensure atomicity
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute("SELECT COUNT(*) FROM queued_torrents") as cursor:
+                    row = await cursor.fetchone()
+                    count = row[0] if row else 0
+                await db.execute("DELETE FROM queued_torrents")
+                await db.commit()
+                return count
+        except Exception as e:
+            logger.error(f"Failed to clear queue: {e}")
+            raise
 
     async def update_queued_retry(self, id: str) -> None:
         """Increment retry count for a queued torrent."""
@@ -597,13 +613,19 @@ class PersistenceManager:
 
     async def clear_qnap_pending(self) -> int:
         """Clear all QNAP pending downloads. Returns count deleted."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT COUNT(*) FROM qnap_pending") as cursor:
-                row = await cursor.fetchone()
-                count = row[0] if row else 0
-            await db.execute("DELETE FROM qnap_pending")
-            await db.commit()
-            return count
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # Use a single transaction to ensure atomicity
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute("SELECT COUNT(*) FROM qnap_pending") as cursor:
+                    row = await cursor.fetchone()
+                    count = row[0] if row else 0
+                await db.execute("DELETE FROM qnap_pending")
+                await db.commit()
+                return count
+        except Exception as e:
+            logger.error(f"Failed to clear QNAP pending: {e}")
+            raise
 
     # -------------------------------------------------------------------------
     # Activity Log Operations
@@ -793,17 +815,27 @@ class PersistenceManager:
 
     async def get_stats(self) -> Dict:
         """Get database statistics."""
-        async with aiosqlite.connect(self.db_path) as db:
-            stats = {}
+        # Allowed table names (prevents SQL injection)
+        ALLOWED_TABLES = frozenset([
+            "torrents", "queued_torrents", "categories",
+            "hash_mappings", "local_downloads", "qnap_pending", "activity_log",
+            "tags", "torrent_tags"
+        ])
 
-            for table in ["torrents", "queued_torrents", "categories",
-                         "hash_mappings", "local_downloads", "qnap_pending", "activity_log",
-                         "tags", "torrent_tags"]:
-                async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
-                    row = await cursor.fetchone()
-                    stats[table] = row[0] if row else 0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                stats = {}
 
-            return stats
+                for table in ALLOWED_TABLES:
+                    # Table name is validated against allowed list, safe to use
+                    async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
+                        row = await cursor.fetchone()
+                        stats[table] = row[0] if row else 0
+
+                return stats
+        except Exception as e:
+            logger.error(f"Failed to get database stats: {e}")
+            return {}
 
     async def vacuum(self) -> None:
         """Optimize the database."""

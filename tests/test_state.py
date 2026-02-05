@@ -352,7 +352,7 @@ class TestStateManagerTorrentOperations:
     async def test_phase_change_callback(self, manager, sample_torrent):
         """Test phase change callback."""
         callback = AsyncMock()
-        manager.on_phase_change(callback)
+        await manager.on_phase_change(callback)
 
         await manager.add_torrent(sample_torrent)
         await manager.update_phase("ABC123", TorrentPhase.DOWNLOADING_TO_SEEDR)
@@ -367,7 +367,7 @@ class TestStateManagerTorrentOperations:
     async def test_completion_callback(self, manager, sample_torrent):
         """Test completion callback."""
         callback = AsyncMock()
-        manager.on_complete(callback)
+        await manager.on_complete(callback)
 
         await manager.add_torrent(sample_torrent)
         await manager.update_phase("ABC123", TorrentPhase.COMPLETED)
@@ -378,7 +378,7 @@ class TestStateManagerTorrentOperations:
     async def test_error_callback(self, manager, sample_torrent):
         """Test error callback."""
         callback = AsyncMock()
-        manager.on_error(callback)
+        await manager.on_error(callback)
 
         await manager.add_torrent(sample_torrent)
         await manager.record_error("ABC123", "Test error")

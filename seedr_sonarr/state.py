@@ -149,10 +149,14 @@ class StateManager:
         self._tags: Set[str] = set()  # Set of all tag names
         self._torrent_tags: Dict[str, Set[str]] = {}  # torrent_hash -> set of tags
 
-        # Activity callbacks
+        # Activity callbacks (protected by _callback_lock)
+        self._callback_lock = asyncio.Lock()
         self._on_phase_change: List[Callable[[str, TorrentPhase, TorrentPhase], Awaitable]] = []
         self._on_error: List[Callable[[str, str], Awaitable]] = []
         self._on_complete: List[Callable[[str], Awaitable]] = []
+
+        # Constants
+        self._max_error_count = 1000  # Prevent unbounded error counts
 
     async def initialize(self) -> None:
         """Initialize state manager and load persisted state."""
@@ -255,19 +259,22 @@ class StateManager:
     # Callback Registration
     # -------------------------------------------------------------------------
 
-    def on_phase_change(
+    async def on_phase_change(
         self, callback: Callable[[str, TorrentPhase, TorrentPhase], Awaitable]
     ) -> None:
         """Register callback for phase changes."""
-        self._on_phase_change.append(callback)
+        async with self._callback_lock:
+            self._on_phase_change.append(callback)
 
-    def on_error(self, callback: Callable[[str, str], Awaitable]) -> None:
+    async def on_error(self, callback: Callable[[str, str], Awaitable]) -> None:
         """Register callback for errors."""
-        self._on_error.append(callback)
+        async with self._callback_lock:
+            self._on_error.append(callback)
 
-    def on_complete(self, callback: Callable[[str], Awaitable]) -> None:
+    async def on_complete(self, callback: Callable[[str], Awaitable]) -> None:
         """Register callback for download completion."""
-        self._on_complete.append(callback)
+        async with self._callback_lock:
+            self._on_complete.append(callback)
 
     # -------------------------------------------------------------------------
     # Torrent Operations
@@ -344,6 +351,10 @@ class StateManager:
             for k in keys_to_remove:
                 del self._hash_mappings[k]
 
+            # Clean up torrent tags (fix memory leak)
+            if real_hash in self._torrent_tags:
+                del self._torrent_tags[real_hash]
+
             return True
 
     async def update_phase(
@@ -365,9 +376,9 @@ class StateManager:
             torrent.phase = phase
 
             if seedr_progress is not None:
-                torrent.seedr_progress = seedr_progress
+                torrent.seedr_progress = max(0.0, min(1.0, seedr_progress))  # Clamp to [0, 1]
             if local_progress is not None:
-                torrent.local_progress = local_progress
+                torrent.local_progress = max(0.0, min(1.0, local_progress))  # Clamp to [0, 1]
 
             if self._persist_enabled:
                 await self._persistence.save_torrent(PersistedTorrent(
@@ -421,15 +432,15 @@ class StateManager:
                 return
 
             if seedr_progress is not None:
-                torrent.seedr_progress = seedr_progress
+                torrent.seedr_progress = max(0.0, min(1.0, seedr_progress))  # Clamp to [0, 1]
             if local_progress is not None:
-                torrent.local_progress = local_progress
+                torrent.local_progress = max(0.0, min(1.0, local_progress))  # Clamp to [0, 1]
             if download_speed is not None:
-                torrent.download_speed = download_speed
+                torrent.download_speed = max(0, download_speed)  # Ensure non-negative
 
             if self._persist_enabled:
                 await self._persistence.update_torrent_progress(
-                    real_hash, seedr_progress, local_progress
+                    real_hash, torrent.seedr_progress, torrent.local_progress
                 )
 
     async def record_error(self, hash: str, error: str) -> None:
@@ -441,7 +452,7 @@ class StateManager:
             if not torrent:
                 return
 
-            torrent.error_count += 1
+            torrent.error_count = min(torrent.error_count + 1, self._max_error_count)  # Bound error count
             torrent.last_error = error
             torrent.last_error_time = datetime.now().timestamp()
             torrent.phase = TorrentPhase.ERROR
@@ -569,9 +580,14 @@ class StateManager:
 
             return count
 
+    async def get_queue_size(self) -> int:
+        """Get the queue size (thread-safe)."""
+        async with self._lock:
+            return len(self._queue)
+
     @property
     def queue_size(self) -> int:
-        """Get the queue size."""
+        """Get the queue size (non-blocking, may be approximate under concurrency)."""
         return len(self._queue)
 
     # -------------------------------------------------------------------------

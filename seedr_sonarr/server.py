@@ -7,6 +7,7 @@ Supports multiple instances via category-based routing.
 import asyncio
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -101,6 +102,8 @@ sessions: dict[str, datetime] = {}
 SESSION_TIMEOUT = timedelta(hours=24)
 SESSION_CLEANUP_INTERVAL = 300  # Clean up expired sessions every 5 minutes
 QUEUE_PROCESS_INTERVAL = 60  # Process queue every 60 seconds
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB max torrent file upload
+_sessions_lock = asyncio.Lock()  # Lock for thread-safe session access
 _session_cleanup_task: Optional[asyncio.Task] = None
 _queue_process_task: Optional[asyncio.Task] = None
 created_categories: dict[str, dict] = {}  # name -> {savePath, instance_id}
@@ -161,8 +164,8 @@ async def lifespan(app: FastAPI):
         os.makedirs(settings.temp_path, exist_ok=True)
         # Set permissive permissions so all users can read/write
         try:
-            os.chmod(settings.download_path, 0o777)
-            os.chmod(settings.temp_path, 0o777)
+            os.chmod(settings.download_path, 0o755)
+            os.chmod(settings.temp_path, 0o755)
         except OSError:
             pass  # May fail if not owner
         logger.info(f"Download path: {settings.download_path}")
@@ -180,8 +183,9 @@ async def lifespan(app: FastAPI):
         os.remove(test_file)
         logger.info(f"Config path: {config_path}")
     except OSError as e:
-        logger.warning(f"Config path {config_path} not writable: {e}, falling back to /tmp")
-        config_path = "/tmp"
+        logger.error(f"Config path {config_path} not writable: {e}")
+        logger.warning("Using fallback config path - state may not persist correctly")
+        config_path = tempfile.gettempdir()
         os.makedirs(config_path, exist_ok=True)
 
     # Initialize persistence - use config_path for state file
@@ -226,7 +230,7 @@ async def lifespan(app: FastAPI):
                 # Create the directory with permissive permissions
                 try:
                     os.makedirs(save_path, exist_ok=True)
-                    os.chmod(save_path, 0o777)
+                    os.chmod(save_path, 0o755)
                 except OSError as e:
                     logger.warning(f"Could not create category directory {save_path}: {e}")
                 # Persist the category
@@ -345,27 +349,29 @@ app = FastAPI(
 # =============================================================================
 
 
-def validate_session(request: Request) -> bool:
-    """Validate the session cookie."""
+async def validate_session(request: Request) -> bool:
+    """Validate the session cookie (thread-safe)."""
     sid = request.cookies.get("SID")
     if not sid:
         return False
 
-    if sid not in sessions:
-        return False
+    async with _sessions_lock:
+        if sid not in sessions:
+            return False
 
-    if datetime.now() > sessions[sid]:
-        del sessions[sid]
-        return False
+        if datetime.now() > sessions[sid]:
+            sessions.pop(sid, None)
+            return False
 
-    sessions[sid] = datetime.now() + SESSION_TIMEOUT
-    return True
+        sessions[sid] = datetime.now() + SESSION_TIMEOUT
+        return True
 
 
-def create_session() -> str:
-    """Create a new session."""
+async def create_session() -> str:
+    """Create a new session (thread-safe)."""
     sid = secrets.token_hex(16)
-    sessions[sid] = datetime.now() + SESSION_TIMEOUT
+    async with _sessions_lock:
+        sessions[sid] = datetime.now() + SESSION_TIMEOUT
     return sid
 
 
@@ -435,9 +441,9 @@ async def auth_login(
         password = request.query_params.get("password", "")
 
     if username == settings.username and password == settings.password:
-        sid = create_session()
+        sid = await create_session()
         response = PlainTextResponse("Ok.")
-        response.set_cookie(key="SID", value=sid, httponly=True)
+        response.set_cookie(key="SID", value=sid, httponly=True, samesite="lax")
         logger.info(f"User authenticated: {username}")
         return response
 
@@ -450,8 +456,9 @@ async def auth_login(
 async def auth_logout(request: Request):
     """Logout and invalidate session."""
     sid = request.cookies.get("SID")
-    if sid and sid in sessions:
-        del sessions[sid]
+    if sid:
+        async with _sessions_lock:
+            sessions.pop(sid, None)
     return PlainTextResponse("Ok.")
 
 
@@ -463,7 +470,7 @@ async def auth_logout(request: Request):
 @app.get("/api/v2/app/version")
 async def app_version(request: Request):
     """Return qBittorrent version (emulated)."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("v4.6.0")
 
@@ -471,7 +478,7 @@ async def app_version(request: Request):
 @app.get("/api/v2/app/webapiVersion")
 async def app_webapi_version(request: Request):
     """Return WebAPI version."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("2.9.3")
 
@@ -479,7 +486,7 @@ async def app_webapi_version(request: Request):
 @app.get("/api/v2/app/buildInfo")
 async def app_build_info(request: Request):
     """Return build information."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return JSONResponse({
         "qt": "6.5.0",
@@ -494,7 +501,7 @@ async def app_build_info(request: Request):
 @app.get("/api/v2/app/preferences")
 async def app_preferences(request: Request):
     """Return application preferences."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return JSONResponse({
         "save_path": settings.download_path,
@@ -519,7 +526,7 @@ async def app_preferences(request: Request):
 @app.get("/api/v2/app/defaultSavePath")
 async def app_default_save_path(request: Request):
     """Return default save path."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse(settings.download_path)
 
@@ -532,8 +539,11 @@ async def app_default_save_path(request: Request):
 @app.get("/api/v2/transfer/info")
 async def transfer_info(request: Request):
     """Return global transfer info."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     try:
         torrents = await seedr_client.get_torrents()
@@ -573,8 +583,11 @@ async def torrents_info(
     hashes: Optional[str] = None,
 ):
     """Get info about torrents with multi-instance support."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     try:
         torrents = await seedr_client.get_torrents()
@@ -679,8 +692,11 @@ async def torrents_info(
 @app.get("/api/v2/torrents/properties")
 async def torrents_properties(request: Request, hash: str):
     """Get properties of a specific torrent."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     try:
         torrent = await seedr_client.get_torrent(hash.upper())
@@ -738,8 +754,11 @@ async def torrents_properties(request: Request, hash: str):
 @app.get("/api/v2/torrents/files")
 async def torrents_files(request: Request, hash: str):
     """Get files list for a torrent."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     try:
         files = await seedr_client.get_torrent_files(hash.upper())
@@ -772,8 +791,11 @@ async def torrents_add(
     addToTopOfQueue: Optional[str] = Form(None),
 ):
     """Add new torrent(s) with instance tracking."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     # Log all incoming parameters for debugging
     logger.info(
@@ -800,7 +822,12 @@ async def torrents_add(
                     added_hashes.append(torrent_hash)
 
         if torrents:
+            # Validate file size before reading
+            if torrents.size and torrents.size > MAX_UPLOAD_SIZE:
+                raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
             content = await torrents.read()
+            if len(content) > MAX_UPLOAD_SIZE:
+                raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
             if content:
                 logger.info(f"Adding torrent file from {instance_id}: {torrents.filename}")
                 torrent_hash = await seedr_client.add_torrent(
@@ -830,8 +857,11 @@ async def torrents_delete(
     deleteFiles: str = Form("false"),
 ):
     """Delete torrent(s)."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     try:
         delete_files = deleteFiles.lower() == "true"
@@ -855,7 +885,7 @@ async def torrents_delete(
 @app.post("/api/v2/torrents/pause")
 async def torrents_pause(request: Request, hashes: str = Form(...)):
     """Pause torrent(s) - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     logger.debug(f"Pause requested for: {hashes} (no-op)")
     return PlainTextResponse("Ok.")
@@ -864,7 +894,7 @@ async def torrents_pause(request: Request, hashes: str = Form(...)):
 @app.post("/api/v2/torrents/resume")
 async def torrents_resume(request: Request, hashes: str = Form(...)):
     """Resume torrent(s) - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     logger.debug(f"Resume requested for: {hashes} (no-op)")
     return PlainTextResponse("Ok.")
@@ -875,8 +905,11 @@ async def torrents_set_category(
     request: Request, hashes: str = Form(...), category: str = Form("")
 ):
     """Set category for torrent(s)."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     instance_id = extract_instance_id(category)
 
@@ -893,7 +926,7 @@ async def torrents_set_force_start(
     request: Request, hashes: str = Form(...), value: str = Form("true")
 ):
     """Set force start - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -903,7 +936,7 @@ async def torrents_set_super_seeding(
     request: Request, hashes: str = Form(...), value: str = Form("true")
 ):
     """Set super seeding - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -911,7 +944,7 @@ async def torrents_set_super_seeding(
 @app.post("/api/v2/torrents/recheck")
 async def torrents_recheck(request: Request, hashes: str = Form(...)):
     """Recheck torrent(s) - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -919,7 +952,7 @@ async def torrents_recheck(request: Request, hashes: str = Form(...)):
 @app.post("/api/v2/torrents/reannounce")
 async def torrents_reannounce(request: Request, hashes: str = Form(...)):
     """Reannounce torrent(s) - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -929,7 +962,7 @@ async def torrents_rename(
     request: Request, hash: str = Form(...), name: str = Form(...)
 ):
     """Rename torrent - Not implemented."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -939,7 +972,7 @@ async def torrents_set_location(
     request: Request, hashes: str = Form(...), location: str = Form(...)
 ):
     """Set save location - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -950,7 +983,7 @@ async def torrents_set_location(
 @app.post("/api/v2/torrents/decreasePrio")
 async def torrents_priority(request: Request, hashes: str = Form(...)):
     """Set priority - No-op for Seedr."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     return PlainTextResponse("Ok.")
 
@@ -963,7 +996,7 @@ async def torrents_priority(request: Request, hashes: str = Form(...)):
 @app.get("/api/v2/torrents/categories")
 async def torrents_categories(request: Request):
     """Get all categories with instance tracking."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     result = {}
@@ -990,7 +1023,7 @@ async def torrents_create_category(
     request: Request, category: str = Form(...), savePath: str = Form("")
 ):
     """Create a category with instance tracking."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     instance_id = extract_instance_id(category)
@@ -1011,7 +1044,7 @@ async def torrents_create_category(
 
     try:
         os.makedirs(save_path, exist_ok=True)
-        os.chmod(save_path, 0o777)
+        os.chmod(save_path, 0o755)
         logger.info(f"Created category: {category} -> {save_path} (instance: {instance_id})")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
@@ -1024,7 +1057,7 @@ async def torrents_remove_categories(
     request: Request, categories: str = Form(...)
 ):
     """Remove categories."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     for cat in categories.split("\n"):
@@ -1043,7 +1076,7 @@ async def torrents_edit_category(
     request: Request, category: str = Form(...), savePath: str = Form("")
 ):
     """Edit a category."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     instance_id = extract_instance_id(category)
@@ -1063,7 +1096,7 @@ async def torrents_edit_category(
 
     try:
         os.makedirs(save_path, exist_ok=True)
-        os.chmod(save_path, 0o777)
+        os.chmod(save_path, 0o755)
         logger.info(f"Edited category: {category} -> {save_path}")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
@@ -1079,8 +1112,10 @@ async def torrents_edit_category(
 @app.get("/api/v2/torrents/tags")
 async def torrents_tags(request: Request):
     """Get all tags."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+    if not state_manager:
+        return JSONResponse([])
     tags = await state_manager.get_tags()
     return JSONResponse(tags)
 
@@ -1090,7 +1125,7 @@ async def torrents_add_tags(
     request: Request, hashes: str = Form(...), tags: str = Form("")
 ):
     """Add tags to torrents."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not tags:
@@ -1099,7 +1134,7 @@ async def torrents_add_tags(
     hash_list = [h.strip() for h in hashes.split("|") if h.strip()]
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-    if hash_list and tag_list:
+    if hash_list and tag_list and state_manager:
         await state_manager.add_torrent_tags(hash_list, tag_list)
         logger.info(f"Added tags {tag_list} to torrents {hash_list}")
 
@@ -1111,7 +1146,7 @@ async def torrents_remove_tags(
     request: Request, hashes: str = Form(...), tags: str = Form("")
 ):
     """Remove tags from torrents."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not tags:
@@ -1120,7 +1155,7 @@ async def torrents_remove_tags(
     hash_list = [h.strip() for h in hashes.split("|") if h.strip()]
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-    if hash_list and tag_list:
+    if hash_list and tag_list and state_manager:
         await state_manager.remove_torrent_tags(hash_list, tag_list)
         logger.info(f"Removed tags {tag_list} from torrents {hash_list}")
 
@@ -1130,14 +1165,15 @@ async def torrents_remove_tags(
 @app.post("/api/v2/torrents/createTags")
 async def torrents_create_tags(request: Request, tags: str = Form(...)):
     """Create new tags."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-    for tag in tag_list:
-        await state_manager.create_tag(tag)
-        logger.info(f"Created tag: {tag}")
+    if state_manager:
+        for tag in tag_list:
+            await state_manager.create_tag(tag)
+            logger.info(f"Created tag: {tag}")
 
     return PlainTextResponse("Ok.")
 
@@ -1145,14 +1181,15 @@ async def torrents_create_tags(request: Request, tags: str = Form(...)):
 @app.post("/api/v2/torrents/deleteTags")
 async def torrents_delete_tags(request: Request, tags: str = Form(...)):
     """Delete tags."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-    for tag in tag_list:
-        if await state_manager.delete_tag(tag):
-            logger.info(f"Deleted tag: {tag}")
+    if state_manager:
+        for tag in tag_list:
+            if await state_manager.delete_tag(tag):
+                logger.info(f"Deleted tag: {tag}")
 
     return PlainTextResponse("Ok.")
 
@@ -1165,8 +1202,11 @@ async def torrents_delete_tags(request: Request, tags: str = Form(...)):
 @app.get("/api/v2/sync/maindata")
 async def sync_maindata(request: Request, rid: int = 0):
     """Get sync data with enhanced phase and instance info."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not seedr_client:
+        raise HTTPException(status_code=503, detail="Seedr client not initialized")
 
     try:
         torrents = await seedr_client.get_torrents()
@@ -1294,7 +1334,7 @@ async def health_check():
 @app.get("/api/seedr/downloads")
 async def get_download_status(request: Request):
     """Get status of all downloads with enhanced phase tracking."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1349,7 +1389,7 @@ async def get_download_status(request: Request):
 @app.post("/api/seedr/downloads/start")
 async def start_download(request: Request, hashes: str = Form(...)):
     """Force start downloading specific torrents."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1376,7 +1416,7 @@ async def start_download(request: Request, hashes: str = Form(...)):
 @app.post("/api/seedr/downloads/stop")
 async def stop_download(request: Request, hashes: str = Form(...)):
     """Stop downloading specific torrents."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1399,7 +1439,7 @@ async def stop_download(request: Request, hashes: str = Form(...)):
 @app.get("/api/seedr/settings")
 async def get_seedr_settings(request: Request):
     """Get Seedr account settings and usage."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1429,7 +1469,7 @@ async def get_seedr_settings(request: Request):
 @app.get("/api/seedr/queue")
 async def get_queue(request: Request):
     """Get the queue of torrents with instance info."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1450,7 +1490,7 @@ async def get_queue(request: Request):
 @app.post("/api/seedr/queue/clear")
 async def clear_queue(request: Request):
     """Clear all queued torrents."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1467,7 +1507,7 @@ async def clear_queue(request: Request):
 @app.post("/api/seedr/queue/process")
 async def process_queue(request: Request):
     """Force process the queue."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1487,7 +1527,7 @@ async def process_queue(request: Request):
 @app.get("/api/seedr/storage")
 async def get_storage(request: Request):
     """Get Seedr storage information."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:
@@ -1521,7 +1561,7 @@ async def get_activity_logs(
     instance_id: Optional[str] = None,
 ):
     """Get activity logs for debugging and monitoring."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not activity_log_handler:
@@ -1548,7 +1588,7 @@ async def get_activity_logs(
 @app.get("/api/seedr/state")
 async def get_state(request: Request):
     """Get current state summary and statistics."""
-    if not validate_session(request):
+    if not await validate_session(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not seedr_client:

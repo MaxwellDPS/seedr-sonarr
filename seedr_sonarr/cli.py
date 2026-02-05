@@ -6,6 +6,8 @@ Full lifecycle management with persistence and multi-instance support.
 import argparse
 import asyncio
 import logging
+import os
+import stat
 import sys
 from typing import Optional
 
@@ -70,8 +72,15 @@ Environment Variables:
     serve_parser.add_argument(
         "--host", "-H", default="0.0.0.0", help="Host to bind to"
     )
+
+    def validate_port(value):
+        ivalue = int(value)
+        if ivalue < 1 or ivalue > 65535:
+            raise argparse.ArgumentTypeError(f"Port must be between 1 and 65535, got {ivalue}")
+        return ivalue
+
     serve_parser.add_argument(
-        "--port", "-p", type=int, default=8080, help="Port to listen on"
+        "--port", "-p", type=validate_port, default=8080, help="Port to listen on (1-65535)"
     )
     serve_parser.add_argument(
         "--email", "-e", help="Seedr email (or use SEEDR_EMAIL env var)"
@@ -92,7 +101,9 @@ Environment Variables:
         "--download-path", "-d", default="/downloads", help="Download path"
     )
     serve_parser.add_argument(
-        "--log-level", "-l", default="INFO", help="Log level"
+        "--log-level", "-l", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
     )
     serve_parser.add_argument(
         "--log-file", help="Log file path (enables rotation)"
@@ -197,16 +208,24 @@ Environment Variables:
     elif args.command == "logs":
         asyncio.run(run_logs(args))
     else:
+        print("Error: No command specified. Use --help for available commands.", file=sys.stderr)
         parser.print_help()
         sys.exit(1)
 
 
 def run_server(args):
     """Run the proxy server."""
-    import os
     import uvicorn
 
     setup_logging(args.log_level)
+
+    # Validate credentials are provided
+    has_token = args.token or os.environ.get("SEEDR_TOKEN")
+    has_email_password = (args.email or os.environ.get("SEEDR_EMAIL")) and \
+                        (args.password or os.environ.get("SEEDR_PASSWORD"))
+
+    if not has_token and not has_email_password:
+        logger.warning("No Seedr credentials provided. Set SEEDR_TOKEN or SEEDR_EMAIL/SEEDR_PASSWORD.")
 
     # Set environment variables for the server
     if args.email:
@@ -268,9 +287,11 @@ async def run_auth(args):
             print(f"\n  Successfully authenticated as: {settings.account.username}")
 
             if args.save:
+                # Write token with restricted permissions (owner read/write only)
                 with open(args.save, "w") as f:
                     f.write(token)
-                print(f"  Token saved to: {args.save}")
+                os.chmod(args.save, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+                print(f"  Token saved to: {args.save} (permissions: 600)")
             else:
                 print("\nYour token (save this for later use):")
                 print("-" * 50)
@@ -363,10 +384,12 @@ async def run_list(args):
 
 async def run_state(args):
     """View persisted state."""
-    import os
-
     if not os.path.exists(args.db):
         print(f"Database not found: {args.db}")
+        sys.exit(1)
+
+    if not os.path.isfile(args.db):
+        print(f"Database path is not a file: {args.db}")
         sys.exit(1)
 
     from .persistence import PersistenceManager
@@ -420,10 +443,12 @@ async def run_state(args):
 
 async def run_queue(args):
     """Manage queue."""
-    import os
-
     if not os.path.exists(args.db):
         print(f"Database not found: {args.db}")
+        sys.exit(1)
+
+    if not os.path.isfile(args.db):
+        print(f"Database path is not a file: {args.db}")
         sys.exit(1)
 
     from .persistence import PersistenceManager
@@ -455,11 +480,14 @@ async def run_queue(args):
 
 async def run_logs(args):
     """View activity logs."""
-    import os
     from datetime import datetime
 
     if not os.path.exists(args.db):
         print(f"Database not found: {args.db}")
+        sys.exit(1)
+
+    if not os.path.isfile(args.db):
+        print(f"Database path is not a file: {args.db}")
         sys.exit(1)
 
     from .persistence import PersistenceManager

@@ -276,6 +276,7 @@ class SeedrClientWrapper:
         self._download_lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
         self._mapping_lock = asyncio.Lock()  # Lock for category/instance mappings
+        self._qnap_lock = asyncio.Lock()  # Lock for QNAP tracking data
 
         # State manager for persistence
         self._state_manager = state_manager
@@ -302,6 +303,7 @@ class SeedrClientWrapper:
         self._last_errors: dict[str, str] = {}  # torrent_hash -> last error message
         self._download_retry_after: dict[str, float] = {}  # torrent_hash -> timestamp when retry is allowed
         self._error_lock = asyncio.Lock()  # Lock for error tracking
+        self._max_error_entries = 1000  # Maximum entries before pruning
 
         # Queue system for storage management
         self._torrent_queue: deque[QueuedTorrent] = deque()
@@ -1085,11 +1087,10 @@ class SeedrClientWrapper:
                     "task_count": len(tasks_list),
                 }
 
-            self._qnap_folder_progress = new_progress
-
             # Remove completed tasks from QNAP Download Station
+            # Collect folders to clean outside the lock, then remove tasks
+            folders_cleaned = set()
             if tasks_to_remove:
-                folders_cleaned = set()
                 for task_id, folder_name in tasks_to_remove:
                     try:
                         success = await self._qnap_client.remove_task(task_id)
@@ -1101,16 +1102,21 @@ class SeedrClientWrapper:
                     except Exception as e:
                         logger.warning(f"Error removing QNAP task {task_id}: {e}")
 
-                # Mark folders as cleaned so we don't try to remove again
-                self._qnap_cleaned_folders.update(folders_cleaned)
+            # Update tracking data with lock protection
+            async with self._qnap_lock:
+                self._qnap_folder_progress = new_progress
 
-            # Clean up _qnap_cleaned_folders - remove entries for folders no longer in QNAP
-            # This prevents the set from growing indefinitely
-            current_folders = set(folder_tasks.keys())
-            stale_cleaned = self._qnap_cleaned_folders - current_folders
-            if stale_cleaned:
-                self._qnap_cleaned_folders -= stale_cleaned
-                logger.debug(f"Cleaned up {len(stale_cleaned)} stale folder entries from tracking")
+                # Mark folders as cleaned so we don't try to remove again
+                if folders_cleaned:
+                    self._qnap_cleaned_folders.update(folders_cleaned)
+
+                # Clean up _qnap_cleaned_folders - remove entries for folders no longer in QNAP
+                # This prevents the set from growing indefinitely
+                current_folders = set(folder_tasks.keys())
+                stale_cleaned = self._qnap_cleaned_folders - current_folders
+                if stale_cleaned:
+                    self._qnap_cleaned_folders -= stale_cleaned
+                    logger.debug(f"Cleaned up {len(stale_cleaned)} stale folder entries from tracking")
 
         except Exception as e:
             logger.warning(f"Failed to query QNAP tasks: {e}")
@@ -1558,6 +1564,20 @@ class SeedrClientWrapper:
         async with self._error_lock:
             self._error_counts[torrent_hash] = self._error_counts.get(torrent_hash, 0) + 1
             self._last_errors[torrent_hash] = error
+
+            # Prune error tracking dicts if they grow too large
+            if len(self._error_counts) > self._max_error_entries:
+                # Keep entries for active torrents, prune the rest
+                active_hashes = set(self._torrents_cache.keys())
+                inactive = [h for h in self._error_counts if h not in active_hashes]
+                # Remove oldest inactive entries (up to half)
+                to_remove = inactive[:len(inactive) // 2] if inactive else []
+                for h in to_remove:
+                    self._error_counts.pop(h, None)
+                    self._last_errors.pop(h, None)
+                    self._download_retry_after.pop(h, None)
+                if to_remove:
+                    logger.debug(f"Pruned {len(to_remove)} stale error tracking entries")
 
         if self._state_manager:
             await self._state_manager.record_error(torrent_hash, error)
@@ -2156,6 +2176,12 @@ class SeedrClientWrapper:
                 self._error_counts.pop(torrent_hash_to_delete, None)
                 self._last_errors.pop(torrent_hash_to_delete, None)
                 self._qnap_pending_completion.pop(torrent_hash_to_delete, None)
+                self._download_retry_after.pop(torrent_hash_to_delete, None)
+
+                # Clean up name-to-hash mapping to prevent memory leak
+                if torrent.name:
+                    normalized_name = normalize_folder_name(torrent.name)
+                    self._name_to_hash_mapping.pop(normalized_name, None)
 
                 if torrent_hash in self._hash_mapping:
                     del self._hash_mapping[torrent_hash]
