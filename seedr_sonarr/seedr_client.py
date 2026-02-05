@@ -1787,9 +1787,9 @@ class SeedrClientWrapper:
                 if hasattr(result, 'hash') and result.hash:
                     torrent_hash = result.hash.upper()
                 elif hasattr(result, 'id'):
-                    torrent_hash = f"SEEDR{result.id}"
+                    torrent_hash = f"SEEDR{result.id:016X}".upper()
                 else:
-                    torrent_hash = f"SEEDR{id(result)}"
+                    torrent_hash = f"SEEDR{id(result):016X}".upper()
 
                 name = getattr(result, 'name', name)
 
@@ -1973,7 +1973,7 @@ class SeedrClientWrapper:
                         if hasattr(result, 'hash') and result.hash:
                             real_hash = result.hash.upper()
                         elif hasattr(result, 'id'):
-                            real_hash = f"SEEDR{result.id}"
+                            real_hash = f"SEEDR{result.id:016X}".upper()
 
                         if real_hash:
                             # Atomic update of hash mapping and category mappings
@@ -2121,18 +2121,19 @@ class SeedrClientWrapper:
                     logger.warning(f"Torrent not found in cache: {torrent_hash_to_delete}")
                     return False
 
-                if torrent_hash_to_delete not in self._local_downloads or not self.delete_after_download:
-                    try:
-                        if torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
-                            await self._client.delete_folder(torrent.id)
-                        else:
-                            await self._client.delete_torrent(torrent.id)
+                # Always try to delete from Seedr - if already deleted, error is handled gracefully
+                try:
+                    if torrent.state in [TorrentState.COMPLETED, TorrentState.DOWNLOADING_LOCAL, TorrentState.COMPLETED_LOCAL]:
+                        await self._client.delete_folder(torrent.id)
+                    else:
+                        await self._client.delete_torrent(torrent.id)
 
-                        await self._update_storage_info()
-                        await self._process_queue()
+                    await self._update_storage_info()
+                    await self._process_queue()
+                    logger.info(f"Deleted from Seedr: {torrent.name}")
 
-                    except Exception as e:
-                        logger.warning(f"Could not delete from Seedr (may already be deleted): {e}")
+                except Exception as e:
+                    logger.debug(f"Could not delete from Seedr (may already be deleted): {e}")
 
                 if delete_files and torrent.content_path:
                     try:
