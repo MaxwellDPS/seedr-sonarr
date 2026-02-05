@@ -22,7 +22,7 @@ import aiohttp
 
 from .logging_config import LogContext
 from .retry import RetryHandler, CircuitBreaker, RetryConfig, CircuitBreakerConfig, RateLimiter, RateLimitTimeoutError
-from .state import TorrentPhase, extract_instance_id
+from .state import TorrentPhase, TorrentState, extract_instance_id
 
 if TYPE_CHECKING:
     from .state import StateManager
@@ -135,12 +135,19 @@ def normalize_folder_name(name: str) -> str:
     """
     if not name:
         return ""
-    # Replace + with space (common Seedr normalization)
+    # Replace common special chars with space
     normalized = name.replace("+", " ")
+    normalized = normalized.replace(".", " ")
+    normalized = normalized.replace("_", " ")
+    normalized = normalized.replace("-", " ")
+    # Remove brackets and their variations
+    for char in "[](){}":
+        normalized = normalized.replace(char, " ")
     # Collapse multiple spaces into one
     while "  " in normalized:
         normalized = normalized.replace("  ", " ")
-    return normalized.strip()
+    # Convert to lowercase for case-insensitive matching
+    return normalized.strip().lower()
 
 
 def sanitize_path_component(name: str) -> str:
@@ -1857,7 +1864,7 @@ class SeedrClientWrapper:
                 with LogContext(torrent_hash=torrent_hash, torrent_name=name, category=category):
                     logger.info(f"Added torrent: {name} (hash: {torrent_hash}, instance: {instance_id})")
 
-                # Log activity
+                # Log activity and persist torrent early (for category recovery on hash transitions)
                 if self._state_manager:
                     await self._state_manager.log_activity(
                         action="torrent_added",
@@ -1866,6 +1873,24 @@ class SeedrClientWrapper:
                         category=category,
                         details=f"Added to Seedr (instance: {instance_id})",
                     )
+                    # Persist the torrent early so we can recover category via fuzzy name match
+                    # if Seedr changes the folder name during processing
+                    if category:
+                        early_torrent = TorrentState(
+                            hash=torrent_hash,
+                            seedr_id=str(getattr(result, 'id', '')),
+                            name=name,
+                            size=0,  # Size not known yet
+                            category=category,
+                            instance_id=instance_id,
+                            phase=TorrentPhase.FETCHING_METADATA,
+                            seedr_progress=0.0,
+                            local_progress=0.0,
+                            added_on=int(datetime.now().timestamp()),
+                            save_path=cat_path,
+                        )
+                        await self._state_manager.add_torrent(early_torrent)
+                        logger.debug(f"Persisted torrent early for category recovery: {name} -> {category}")
 
                 return torrent_hash
 

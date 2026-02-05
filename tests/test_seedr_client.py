@@ -106,24 +106,29 @@ class TestNormalizeFolderName:
         assert normalize_folder_name("") == ""
 
     def test_normal_string(self):
-        """Test normal string passes through."""
-        assert normalize_folder_name("Movie Name") == "Movie Name"
+        """Test normal string is lowercased."""
+        assert normalize_folder_name("Movie Name") == "movie name"
 
     def test_plus_to_space(self):
         """Test + is converted to space."""
-        assert normalize_folder_name("Movie+Name") == "Movie Name"
+        assert normalize_folder_name("Movie+Name") == "movie name"
 
     def test_collapse_spaces(self):
         """Test multiple spaces are collapsed."""
-        assert normalize_folder_name("Movie  Name") == "Movie Name"
+        assert normalize_folder_name("Movie  Name") == "movie name"
 
     def test_strip_whitespace(self):
         """Test whitespace is stripped."""
-        assert normalize_folder_name("  Movie Name  ") == "Movie Name"
+        assert normalize_folder_name("  Movie Name  ") == "movie name"
 
     def test_combined_normalization(self):
         """Test combined normalization."""
-        assert normalize_folder_name("  Movie+Name++Here  ") == "Movie Name Here"
+        assert normalize_folder_name("  Movie+Name++Here  ") == "movie name here"
+
+    def test_special_chars_normalized(self):
+        """Test special chars are converted to spaces."""
+        assert normalize_folder_name("Movie.Name_Here-2024") == "movie name here 2024"
+        assert normalize_folder_name("Movie[2024](1080p)") == "movie 2024 1080p"
 
 
 # ============================================================================
