@@ -329,6 +329,12 @@ class StateManager:
         async with self._lock:
             return list(self._torrents.values())
 
+    async def find_torrent_by_name(self, name: str) -> Optional[PersistedTorrent]:
+        """Find a torrent by fuzzy name match (for hash transitions)."""
+        if self._persistence:
+            return await self._persistence.find_torrent_by_name(name)
+        return None
+
     async def delete_torrent(self, hash: str) -> bool:
         """Delete a torrent."""
         async with self._lock:

@@ -651,6 +651,21 @@ class SeedrClientWrapper:
                                 await self._state_manager.add_hash_mapping(original_hash, torrent_hash)
                             logger.info(f"Hash transition detected: {original_hash} -> {torrent_hash} (category: {category})")
 
+                    # Fallback: try fuzzy name match in persistence if category still not found
+                    # This handles cases where Seedr significantly changed the folder name
+                    if not category and self._state_manager:
+                        persisted = await self._state_manager.find_torrent_by_name(folder.name)
+                        if persisted and persisted.category:
+                            category = persisted.category
+                            instance_id = persisted.instance_id or extract_instance_id(category)
+                            # Cache for future lookups
+                            self._category_mapping[torrent_hash] = category
+                            self._instance_mapping[torrent_hash] = instance_id
+                            self._name_to_hash_mapping[normalized_folder_name] = torrent_hash
+                            if self._state_manager:
+                                await self._state_manager.add_hash_mapping(persisted.hash, torrent_hash)
+                            logger.info(f"Category recovered via fuzzy name match: {folder.name} -> {category} (from {persisted.name})")
+
                     if not instance_id:
                         instance_id = extract_instance_id(category)
                     save_path = self._get_save_path(category)
@@ -1089,18 +1104,29 @@ class SeedrClientWrapper:
 
             # Remove completed tasks from QNAP Download Station
             # Collect folders to clean outside the lock, then remove tasks
-            folders_cleaned = set()
+            # Track removal success per folder - only mark as cleaned if ALL tasks removed
+            folder_removal_results: dict[str, dict] = {}  # folder_name -> {total: int, removed: int}
             if tasks_to_remove:
                 for task_id, folder_name in tasks_to_remove:
+                    if folder_name not in folder_removal_results:
+                        folder_removal_results[folder_name] = {"total": 0, "removed": 0}
+                    folder_removal_results[folder_name]["total"] += 1
+
                     try:
                         success = await self._qnap_client.remove_task(task_id)
                         if success:
                             logger.info(f"Removed completed QNAP task {task_id} for {folder_name}")
-                            folders_cleaned.add(folder_name)
+                            folder_removal_results[folder_name]["removed"] += 1
                         else:
                             logger.warning(f"Failed to remove QNAP task {task_id}")
                     except Exception as e:
                         logger.warning(f"Error removing QNAP task {task_id}: {e}")
+
+            # Only mark folders as cleaned if ALL their tasks were successfully removed
+            folders_cleaned = {
+                folder_name for folder_name, results in folder_removal_results.items()
+                if results["removed"] == results["total"]
+            }
 
             # Update tracking data with lock protection
             async with self._qnap_lock:

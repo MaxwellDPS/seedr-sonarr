@@ -319,6 +319,68 @@ class PersistenceManager:
                     updated_at=row["updated_at"],
                 )
 
+    async def find_torrent_by_name(self, name: str) -> Optional[PersistedTorrent]:
+        """Find a torrent by fuzzy name match (for hash transitions when Seedr changes names)."""
+        if not name:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # Try exact match first
+            async with db.execute(
+                "SELECT * FROM torrents WHERE name = ? ORDER BY added_on DESC LIMIT 1", (name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return PersistedTorrent(
+                        hash=row["hash"],
+                        seedr_id=row["seedr_id"],
+                        name=row["name"],
+                        size=row["size"],
+                        category=row["category"],
+                        instance_id=row["instance_id"],
+                        state=row["state"],
+                        phase=row["phase"],
+                        seedr_progress=row["seedr_progress"],
+                        local_progress=row["local_progress"],
+                        added_on=row["added_on"],
+                        save_path=row["save_path"],
+                        content_path=row["content_path"],
+                        error_count=row["error_count"],
+                        last_error=row["last_error"],
+                        last_error_time=row["last_error_time"],
+                        updated_at=row["updated_at"],
+                    )
+
+            # Try LIKE match (name contains the search or vice versa)
+            # This handles cases where Seedr truncates or modifies the name
+            search_pattern = f"%{name[:50]}%"  # Use first 50 chars for matching
+            async with db.execute(
+                "SELECT * FROM torrents WHERE name LIKE ? OR ? LIKE '%' || name || '%' ORDER BY added_on DESC LIMIT 1",
+                (search_pattern, name)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return PersistedTorrent(
+                        hash=row["hash"],
+                        seedr_id=row["seedr_id"],
+                        name=row["name"],
+                        size=row["size"],
+                        category=row["category"],
+                        instance_id=row["instance_id"],
+                        state=row["state"],
+                        phase=row["phase"],
+                        seedr_progress=row["seedr_progress"],
+                        local_progress=row["local_progress"],
+                        added_on=row["added_on"],
+                        save_path=row["save_path"],
+                        content_path=row["content_path"],
+                        error_count=row["error_count"],
+                        last_error=row["last_error"],
+                        last_error_time=row["last_error_time"],
+                        updated_at=row["updated_at"],
+                    )
+            return None
+
     async def delete_torrent(self, hash: str) -> None:
         """Delete a torrent."""
         try:
