@@ -483,14 +483,12 @@ class CircuitBreaker:
             logger.info(f"Circuit breaker '{self.name}' manually reset")
 
 
-class CircuitOpenError(Exception):
-    """Raised when circuit breaker is open."""
-    pass
+# Import from exceptions module for backwards compatibility
+# These are re-exported here to avoid breaking existing imports
+from .exceptions import CircuitOpenError, RateLimitTimeoutError
 
-
-class RateLimitTimeoutError(Exception):
-    """Raised when rate limiter times out waiting for a token."""
-    pass
+# Keep old class definitions as aliases for backwards compatibility
+# (The actual classes are now in exceptions.py)
 
 
 class RateLimiter:

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import Optional, Callable, TYPE_CHECKING, Awaitable, TypeAlias
 
 import aiofiles
 import aiohttp
@@ -27,6 +27,10 @@ from .state import TorrentPhase, TorrentState, extract_instance_id
 if TYPE_CHECKING:
     from .state import StateManager
     from .qnap_client import QnapDownloadStationClient
+
+# Type aliases for callbacks
+ProgressCallback: TypeAlias = Callable[[int], None]
+AsyncCallback: TypeAlias = Callable[[], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -279,11 +283,19 @@ class SeedrClientWrapper:
         self._qnap_pending_completion: dict[str, dict] = {}  # torrent_hash -> info for persistence when QNAP completes
 
         self._client = None
+        # Lock ordering to prevent deadlocks (always acquire in this order):
+        # 1. _lock (main operations lock - protects API calls and cache)
+        # 2. _queue_lock (queue operations)
+        # 3. _download_lock (download operations)
+        # 4. _mapping_lock (category/instance/hash mappings)
+        # 5. _qnap_lock (QNAP tracking data)
+        # 6. _error_lock (error tracking)
+        # Note: Most operations only need one lock. Nested locking is rare.
         self._lock = asyncio.Lock()
         self._download_lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
-        self._mapping_lock = asyncio.Lock()  # Lock for category/instance mappings
-        self._qnap_lock = asyncio.Lock()  # Lock for QNAP tracking data
+        self._mapping_lock = asyncio.Lock()
+        self._qnap_lock = asyncio.Lock()
 
         # State manager for persistence
         self._state_manager = state_manager
@@ -741,8 +753,9 @@ class SeedrClientWrapper:
                         is_local = True
 
                         # Persist completion if we have pending info
-                        if torrent_hash in self._qnap_pending_completion and self._state_manager:
-                            pending = self._qnap_pending_completion.pop(torrent_hash)
+                        async with self._qnap_lock:
+                            pending = self._qnap_pending_completion.pop(torrent_hash, None)
+                        if pending and self._state_manager:
                             logger.info(f"QNAP completed - persisting torrent: {pending['folder_name']}")
                             await self._state_manager.mark_local_download(torrent_hash)
                             await self._state_manager.save_completed_torrent(
@@ -919,7 +932,10 @@ class SeedrClientWrapper:
                 # Add pending QNAP downloads (deleted from Seedr but still downloading via QNAP)
                 seen_hashes = {t.hash for t in torrents}
                 pending_to_remove = []  # Track items to remove after iteration
-                for pending_hash, pending in list(self._qnap_pending_completion.items()):
+                # Take snapshot under lock to avoid race condition during iteration
+                async with self._qnap_lock:
+                    pending_snapshot = list(self._qnap_pending_completion.items())
+                for pending_hash, pending in pending_snapshot:
                     if pending_hash not in seen_hashes:
                         # Get QNAP progress for this folder
                         qnap_info = self._get_qnap_progress(pending["folder_name"]) if self._qnap_client else {}
@@ -1003,8 +1019,10 @@ class SeedrClientWrapper:
                         logger.debug(f"Added pending QNAP torrent: {pending['folder_name']} (status={qnap_status})")
 
                 # Remove completed pending items after iteration
-                for h in pending_to_remove:
-                    self._qnap_pending_completion.pop(h, None)
+                if pending_to_remove:
+                    async with self._qnap_lock:
+                        for h in pending_to_remove:
+                            self._qnap_pending_completion.pop(h, None)
 
                 # Add persisted completed torrents that are no longer in Seedr
                 # This ensures completed downloads still appear after Seedr deletion
@@ -1301,14 +1319,14 @@ class SeedrClientWrapper:
 
                     # Create the destination folder on the local filesystem
                     # This is required because QNAP needs the folder to exist before downloading
-                    os.makedirs(local_dest, exist_ok=True)
+                    await asyncio.to_thread(os.makedirs, local_dest, exist_ok=True)
                     # Set permissive permissions so all users can read/write
                     try:
-                        os.chmod(local_dest, 0o777)
+                        await asyncio.to_thread(os.chmod, local_dest, 0o777)
                         # Also set permissions on parent category folder if it exists
                         if safe_category:
                             category_folder = safe_join_path(self.download_path, safe_category)
-                            os.chmod(category_folder, 0o777)
+                            await asyncio.to_thread(os.chmod, category_folder, 0o777)
                     except OSError as e:
                         logger.warning(f"Could not set permissions on {local_dest}: {e}")
                     logger.info(f"Created local destination folder: {local_dest}")
@@ -1408,15 +1426,16 @@ class SeedrClientWrapper:
                     # Store torrent info for when QNAP completes (needed for persistence after Seedr deletion)
                     # We'll persist as completed when QNAP reports completion in get_torrents()
                     pending_instance_id = self._instance_mapping.get(torrent_hash, "") or extract_instance_id(category)
-                    self._qnap_pending_completion[torrent_hash] = {
-                        "folder_id": folder_id,
-                        "folder_name": folder_name,
-                        "total_size": total_size,
-                        "category": category,
-                        "instance_id": pending_instance_id,
-                        "save_path": save_path,
-                        "content_path": local_dest,
-                    }
+                    async with self._qnap_lock:
+                        self._qnap_pending_completion[torrent_hash] = {
+                            "folder_id": folder_id,
+                            "folder_name": folder_name,
+                            "total_size": total_size,
+                            "category": category,
+                            "instance_id": pending_instance_id,
+                            "save_path": save_path,
+                            "content_path": local_dest,
+                        }
 
                     # Persist to database so we can recover on restart
                     if self._state_manager:
@@ -1463,9 +1482,9 @@ class SeedrClientWrapper:
                     logger.info(f"Starting download of {folder_name} to {save_path}")
 
                     dest_dir = os.path.join(save_path, folder_name)
-                    os.makedirs(dest_dir, exist_ok=True)
+                    await asyncio.to_thread(os.makedirs, dest_dir, exist_ok=True)
                     try:
-                        os.chmod(dest_dir, 0o777)
+                        await asyncio.to_thread(os.chmod, dest_dir, 0o777)
                     except OSError:
                         pass
 
@@ -1847,9 +1866,9 @@ class SeedrClientWrapper:
                                     self._category_mapping[found_hash] = category
                                     self._instance_mapping[found_hash] = instance_id
                                     cat_path = safe_join_path(self.download_path, category)
-                                    os.makedirs(cat_path, exist_ok=True)
+                                    await asyncio.to_thread(os.makedirs, cat_path, exist_ok=True)
                                     try:
-                                        os.chmod(cat_path, 0o777)
+                                        await asyncio.to_thread(os.chmod, cat_path, 0o777)
                                     except OSError:
                                         pass
                                 logger.info(f"Successfully added torrent (recovered from parse error): {name} -> {found_hash}")
@@ -1893,9 +1912,9 @@ class SeedrClientWrapper:
                     self._category_mapping[torrent_hash] = category
                     self._instance_mapping[torrent_hash] = instance_id
                     cat_path = safe_join_path(self.download_path, category)
-                    os.makedirs(cat_path, exist_ok=True)
+                    await asyncio.to_thread(os.makedirs, cat_path, exist_ok=True)
                     try:
-                        os.chmod(cat_path, 0o777)
+                        await asyncio.to_thread(os.chmod, cat_path, 0o777)
                     except OSError:
                         pass
 
@@ -2145,9 +2164,9 @@ class SeedrClientWrapper:
 
                         if queued.category:
                             cat_path = safe_join_path(self.download_path, queued.category)
-                            os.makedirs(cat_path, exist_ok=True)
+                            await asyncio.to_thread(os.makedirs, cat_path, exist_ok=True)
                             try:
-                                os.chmod(cat_path, 0o777)
+                                await asyncio.to_thread(os.chmod, cat_path, 0o777)
                             except OSError:
                                 pass
 
@@ -2306,7 +2325,8 @@ class SeedrClientWrapper:
                 self._local_downloads.discard(torrent_hash_to_delete)
                 self._error_counts.pop(torrent_hash_to_delete, None)
                 self._last_errors.pop(torrent_hash_to_delete, None)
-                self._qnap_pending_completion.pop(torrent_hash_to_delete, None)
+                async with self._qnap_lock:
+                    self._qnap_pending_completion.pop(torrent_hash_to_delete, None)
                 self._download_retry_after.pop(torrent_hash_to_delete, None)
 
                 # Clean up name-to-hash mapping to prevent memory leak

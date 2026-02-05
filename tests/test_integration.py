@@ -13,6 +13,20 @@ from dataclasses import dataclass
 from typing import Optional
 
 from fastapi.testclient import TestClient
+from seedr_sonarr.server import reset_auth_rate_limit
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reset auth rate limiter before each test."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.run_until_complete(reset_auth_rate_limit())
+    yield
+    loop.run_until_complete(reset_auth_rate_limit())
 
 
 # =============================================================================

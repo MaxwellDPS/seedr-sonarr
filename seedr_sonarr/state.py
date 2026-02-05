@@ -1024,7 +1024,7 @@ class StateManager:
                     return self._name_hash_mappings[cache_key]
 
             # Try any instance in cache
-            for (name, inst), mapping in self._name_hash_mappings.items():
+            for (name, _inst), mapping in self._name_hash_mappings.items():
                 if name == normalized_name:
                     return mapping
 

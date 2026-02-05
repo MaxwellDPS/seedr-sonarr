@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import secrets
 
-from fastapi import FastAPI, Form, HTTPException, Request, Response, UploadFile, File
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile, File
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -108,6 +108,12 @@ _session_cleanup_task: Optional[asyncio.Task] = None
 _queue_process_task: Optional[asyncio.Task] = None
 created_categories: dict[str, dict] = {}  # name -> {savePath, instance_id}
 
+# Login rate limiting (IP-based)
+AUTH_RATE_LIMIT_ATTEMPTS = 5  # Max attempts per window
+AUTH_RATE_LIMIT_WINDOW = 900  # 15 minutes in seconds
+_auth_attempts: dict[str, list[float]] = {}  # IP -> list of attempt timestamps
+_auth_lock = asyncio.Lock()
+
 
 async def _cleanup_expired_sessions():
     """Periodically clean up expired sessions to prevent memory leaks."""
@@ -115,9 +121,11 @@ async def _cleanup_expired_sessions():
         try:
             await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
             now = datetime.now()
-            expired = [sid for sid, expiry in sessions.items() if now > expiry]
-            for sid in expired:
-                sessions.pop(sid, None)
+            # Use lock to prevent race condition with dict mutation during iteration
+            async with _sessions_lock:
+                expired = [sid for sid, expiry in sessions.items() if now > expiry]
+                for sid in expired:
+                    sessions.pop(sid, None)
             if expired:
                 logger.debug(f"Cleaned up {len(expired)} expired sessions")
         except asyncio.CancelledError:
@@ -375,6 +383,72 @@ async def create_session() -> str:
     return sid
 
 
+async def require_auth(request: Request) -> None:
+    """
+    FastAPI dependency that validates authentication.
+    Raises HTTPException(403) if not authenticated.
+
+    Usage:
+        @app.get("/api/v2/some/endpoint")
+        async def some_endpoint(request: Request, _: None = Depends(require_auth)):
+            ...
+    """
+    if not await validate_session(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+async def check_auth_rate_limit(client_ip: str) -> bool:
+    """
+    Check if client IP is rate limited for authentication attempts.
+    Returns True if allowed to attempt, False if rate limited.
+    """
+    now = datetime.now().timestamp()
+    window_start = now - AUTH_RATE_LIMIT_WINDOW
+
+    async with _auth_lock:
+        if client_ip not in _auth_attempts:
+            _auth_attempts[client_ip] = []
+
+        # Remove old attempts outside the window
+        _auth_attempts[client_ip] = [
+            ts for ts in _auth_attempts[client_ip] if ts > window_start
+        ]
+
+        # Check if under limit
+        if len(_auth_attempts[client_ip]) >= AUTH_RATE_LIMIT_ATTEMPTS:
+            return False
+
+        return True
+
+
+async def record_auth_attempt(client_ip: str) -> None:
+    """Record a failed authentication attempt for rate limiting."""
+    now = datetime.now().timestamp()
+    async with _auth_lock:
+        if client_ip not in _auth_attempts:
+            _auth_attempts[client_ip] = []
+        _auth_attempts[client_ip].append(now)
+
+        # Limit the size of the tracking dict to prevent memory issues
+        if len(_auth_attempts) > 10000:
+            # Remove oldest entries
+            oldest_ips = sorted(
+                _auth_attempts.keys(),
+                key=lambda ip: min(_auth_attempts[ip]) if _auth_attempts[ip] else 0
+            )[:5000]
+            for ip in oldest_ips:
+                _auth_attempts.pop(ip, None)
+
+
+async def reset_auth_rate_limit(client_ip: str | None = None) -> None:
+    """Reset rate limiting for a specific IP or all IPs (for testing)."""
+    async with _auth_lock:
+        if client_ip:
+            _auth_attempts.pop(client_ip, None)
+        else:
+            _auth_attempts.clear()
+
+
 def state_to_qbittorrent(state: TorrentState) -> str:
     """Convert internal state to qBittorrent state string."""
     return state.value
@@ -435,19 +509,32 @@ async def auth_login(
     password: Optional[str] = Form(None),
 ):
     """Authenticate and create a session."""
+    # Get client IP for rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Check rate limit before processing
+    if not await check_auth_rate_limit(client_ip):
+        logger.warning(f"Rate limited authentication attempt from: {client_ip}")
+        return PlainTextResponse("Fails.")
+
     if not username:
         username = request.query_params.get("username", "")
     if not password:
         password = request.query_params.get("password", "")
 
-    if username == settings.username and password == settings.password:
+    # Use timing-safe comparison to prevent timing attacks
+    username_match = secrets.compare_digest(username, settings.username)
+    password_match = secrets.compare_digest(password, settings.password)
+    if username_match and password_match:
         sid = await create_session()
         response = PlainTextResponse("Ok.")
         response.set_cookie(key="SID", value=sid, httponly=True, samesite="lax")
         logger.info(f"User authenticated: {username}")
         return response
 
-    logger.warning(f"Failed authentication attempt for: {username}")
+    # Record failed attempt for rate limiting
+    await record_auth_attempt(client_ip)
+    logger.warning(f"Failed authentication attempt for: {username} from {client_ip}")
     return PlainTextResponse("Fails.")
 
 
@@ -1043,8 +1130,8 @@ async def torrents_create_category(
         ))
 
     try:
-        os.makedirs(save_path, exist_ok=True)
-        os.chmod(save_path, 0o755)
+        await asyncio.to_thread(os.makedirs, save_path, exist_ok=True)
+        await asyncio.to_thread(os.chmod, save_path, 0o755)
         logger.info(f"Created category: {category} -> {save_path} (instance: {instance_id})")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")
@@ -1095,8 +1182,8 @@ async def torrents_edit_category(
         ))
 
     try:
-        os.makedirs(save_path, exist_ok=True)
-        os.chmod(save_path, 0o755)
+        await asyncio.to_thread(os.makedirs, save_path, exist_ok=True)
+        await asyncio.to_thread(os.chmod, save_path, 0o755)
         logger.info(f"Edited category: {category} -> {save_path}")
     except OSError as e:
         logger.warning(f"Could not create category directory {save_path}: {e}")

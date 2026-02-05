@@ -13,9 +13,6 @@ from seedr_sonarr.persistence import (
     PersistenceManager,
     PersistedTorrent,
     PersistedQueuedTorrent,
-    PersistedCategory,
-    ActivityLogEntry,
-    PersistedNameHashMapping,
 )
 
 
